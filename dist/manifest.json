@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "Prompter Chrome",
+  "description": "Offline manager promptow z automatycznym backupem JSON.",
+  "version": "0.1.0",
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": ["storage", "downloads"],
+  "host_permissions": ["https://chatgpt.com/*", "https://claude.ai/*"],
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*", "https://claude.ai/*"],
+      "js": ["content-script.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Prompter Chrome"
+  }
+}
