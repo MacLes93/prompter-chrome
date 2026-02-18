@@ -1,39 +1,59 @@
 # Prompter Chrome (MV3)
 
-Rozszerzenie Chrome z biblioteką promptów, działające offline.
+Offline Chrome extension for managing prompt templates.
 
-## Co zapisuje dane
+## Features
 
-- Główne dane: `chrome.storage.local` (odporne na restart/crash przeglądarki).
-- Backup pliku JSON: `Downloads/prompter_chrome/prompts-latest.json`.
-- Po zmianach pojawia się nieblokujący pasek info u góry aplikacji.
-- Klik paska rozwija akcję: `Pobierz backup (nadpisz stary)`.
+- Prompt library with categories, tags, favorites, and quick filtering.
+- JSON import/export and backup flow.
+- Quick-save widget on `chatgpt.com` and `claude.ai`.
+- UI language switch: English and Polish (`Settings -> Language`).
 
-## Quick save z ChatGPT i Claude
+## Data Storage
 
-- Na `chatgpt.com` i `claude.ai` pojawia się przycisk `+ Save to Prompter`.
-- Klik otwiera mały formularz (tytuł, treść, tagi).
-- Zapis trafia od razu do tej samej biblioteki (`chrome.storage.local`).
+- Main data: `chrome.storage.local` (persistent across browser restarts/crashes).
+- Backup file: `Downloads/prompter_chrome/prompts-latest.json`.
+- Unsaved backup changes show a non-blocking notice in the app header.
 
-## Uruchomienie
+## Quick Save (ChatGPT + Claude)
+
+- Adds a `+ Save to Prompter` button on `chatgpt.com` and `claude.ai`.
+- Opens a small form (title, content, tags).
+- Saves directly into the same extension library (`chrome.storage.local`).
+- Widget texts follow the selected app language (EN/PL).
+
+## Setup
 
 ```bash
-cd /Users/mlesniewski/Codex/prompter/prompter_chrome
+cd <path-to-repository>
 npm install
 npm run build
 ```
 
-## Instalacja w Chrome
+## Load in Chrome
 
-1. Otwórz `chrome://extensions`.
-2. Włącz `Developer mode`.
-3. Kliknij `Load unpacked`.
-4. Wskaż folder: `/Users/mlesniewski/Codex/prompter/prompter_chrome/dist`.
-5. Otwórz `Details` rozszerzenia i wejdź w `Extension options`.
+1. Open `chrome://extensions`.
+2. Enable `Developer mode`.
+3. Click `Load unpacked`.
+4. Select the `dist` directory from this project.
+5. Open extension `Details` and click `Extension options`.
 
-## Routing
+After code changes:
 
-- `#prompts` - biblioteka kart + pełny podgląd po kliknięciu.
-- `#create` - oddzielna strona dodawania/edycji promptu.
-- `#categories` - kategorie.
-- `#data` - import/export.
+1. Run `npm run build`.
+2. In `chrome://extensions`, click `Reload` for this extension.
+
+## App Routes
+
+- `#dashboard` - summary cards, recent prompts, top tags.
+- `#prompts` - prompt library and full preview modal.
+- `#create` - create/edit prompt view.
+- `#categories` - category management.
+- `#data` - import/export and data summary.
+- `#settings` - language and site integration settings.
+
+## Required Permissions
+
+- `storage` - save app data and settings.
+- `downloads` - write JSON backups.
+- Host permissions for `https://chatgpt.com/*` and `https://claude.ai/*` - quick-save widget injection.
