@@ -4,13 +4,24 @@
 
   const ROOT_ID = "prompter-quick-save-root";
   const QUICK_SAVE_ENABLED_KEY = "prompter.quickSaveEnabled";
+  const LANGUAGE_KEY = "prompter.language";
 
   let root = null;
   let panel = null;
   let titleInput = null;
   let contentInput = null;
   let tagsInput = null;
+  let launchButton = null;
+  let headingEl = null;
+  let minimizeButton = null;
+  let saveButton = null;
+  let cancelButton = null;
+  let language = "pl";
   let isOpen = false;
+
+  function t(pl, en) {
+    return language === "pl" ? pl : en;
+  }
 
   function getDraftContent() {
     const selected = window.getSelection()?.toString().trim();
@@ -41,7 +52,8 @@
   }
 
   function makeTitle(content) {
-    const firstLine = content.split("\n").find((line) => line.trim().length > 0) || "Nowy prompt";
+    const firstLine =
+      content.split("\n").find((line) => line.trim().length > 0) || t("Nowy prompt", "New prompt");
     const clean = firstLine.trim();
     return clean.length > 72 ? `${clean.slice(0, 72)}...` : clean;
   }
@@ -181,7 +193,7 @@
     if (!panel || !titleInput || !contentInput) return;
     const draft = getDraftContent();
     contentInput.value = draft;
-    titleInput.value = makeTitle(draft || "Nowy prompt");
+    titleInput.value = makeTitle(draft);
     setPanelOpen(true);
     titleInput.focus();
   }
@@ -203,7 +215,37 @@
     titleInput = null;
     contentInput = null;
     tagsInput = null;
+    launchButton = null;
+    headingEl = null;
+    minimizeButton = null;
+    saveButton = null;
+    cancelButton = null;
     isOpen = false;
+  }
+
+  function applyLanguageTexts() {
+    if (!launchButton || !headingEl || !minimizeButton || !saveButton || !cancelButton) return;
+    if (!titleInput || !contentInput || !tagsInput) return;
+
+    launchButton.textContent = t("+ Zapisz do Prompter", "+ Save to Prompter");
+    headingEl.textContent = t("Dodaj prompt z tej rozmowy", "Add prompt from this conversation");
+    minimizeButton.title = t("Minimalizuj", "Minimize");
+    titleInput.placeholder = t("Tytuł", "Title");
+    contentInput.placeholder = t("Treść promptu", "Prompt content");
+    tagsInput.placeholder = t("Tagi (oddziel przecinkiem)", "Tags (comma-separated)");
+    saveButton.textContent = t("Zapisz do biblioteki", "Save to library");
+    cancelButton.textContent = t("Zamknij", "Close");
+  }
+
+  function translateRuntimeError(message) {
+    const normalized = (message || "").trim().toLowerCase();
+    if (!normalized) return t("Błąd zapisu", "Save error");
+    if (language === "pl") return message;
+
+    if (normalized === "tytul jest wymagany") return "Title is required";
+    if (normalized === "tresc promptu jest wymagana") return "Prompt content is required";
+    if (normalized === "blad zapisu") return "Save error";
+    return message;
   }
 
   function mountWidget() {
@@ -213,10 +255,9 @@
     root = document.createElement("div");
     root.id = ROOT_ID;
 
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "prompter-fab";
-    button.textContent = "+ Save to Prompter";
+    launchButton = document.createElement("button");
+    launchButton.type = "button";
+    launchButton.className = "prompter-fab";
 
     panel = document.createElement("div");
     panel.className = "prompter-panel";
@@ -224,60 +265,55 @@
     const header = document.createElement("div");
     header.className = "prompter-panel-header";
 
-    const heading = document.createElement("h4");
-    heading.textContent = "Dodaj prompt z tej rozmowy";
+    headingEl = document.createElement("h4");
 
-    const minimize = document.createElement("button");
-    minimize.type = "button";
-    minimize.textContent = "_";
-    minimize.title = "Minimalizuj";
+    minimizeButton = document.createElement("button");
+    minimizeButton.type = "button";
+    minimizeButton.textContent = "_";
 
-    header.append(heading, minimize);
+    header.append(headingEl, minimizeButton);
 
     titleInput = document.createElement("input");
-    titleInput.placeholder = "Tytuł";
 
     contentInput = document.createElement("textarea");
-    contentInput.placeholder = "Treść promptu";
 
     tagsInput = document.createElement("input");
-    tagsInput.placeholder = "Tagi (oddziel przecinkiem)";
 
     const actions = document.createElement("div");
     actions.className = "prompter-row";
 
-    const save = document.createElement("button");
-    save.type = "button";
-    save.className = "primary";
-    save.textContent = "Zapisz do biblioteki";
+    saveButton = document.createElement("button");
+    saveButton.type = "button";
+    saveButton.className = "primary";
 
-    const cancel = document.createElement("button");
-    cancel.type = "button";
-    cancel.className = "ghost";
-    cancel.textContent = "Zamknij";
+    cancelButton = document.createElement("button");
+    cancelButton.type = "button";
+    cancelButton.className = "ghost";
 
-    actions.append(save, cancel);
+    applyLanguageTexts();
+
+    actions.append(saveButton, cancelButton);
     panel.append(header, titleInput, contentInput, tagsInput, actions);
 
-    button.addEventListener("click", (event) => {
+    launchButton.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
       togglePanel();
     });
 
-    minimize.addEventListener("click", (event) => {
+    minimizeButton.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
       closePanel();
     });
 
-    cancel.addEventListener("click", (event) => {
+    cancelButton.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
       closePanel();
     });
 
-    save.addEventListener("click", (event) => {
+    saveButton.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
 
@@ -293,16 +329,16 @@
         },
         (response) => {
           if (chrome.runtime.lastError) {
-            showToast("Nie udało się zapisać promptu", "error");
+            showToast(t("Nie udało się zapisać promptu", "Failed to save prompt"), "error");
             return;
           }
 
           if (!response?.ok) {
-            showToast(response?.error || "Błąd zapisu", "error");
+            showToast(translateRuntimeError(response?.error), "error");
             return;
           }
 
-          showToast("Prompt zapisany w Prompter");
+          showToast(t("Prompt zapisany w Prompter", "Prompt saved in Prompter"));
           closePanel();
           if (tagsInput) tagsInput.value = "";
         }
@@ -323,7 +359,7 @@
       }
     });
 
-    root.append(button, panel);
+    root.append(launchButton, panel);
     document.body.appendChild(root);
   }
 
@@ -333,25 +369,40 @@
     return value === undefined ? true : Boolean(value);
   }
 
+  async function loadLanguage() {
+    const result = await chrome.storage.local.get([LANGUAGE_KEY]);
+    const value = result?.[LANGUAGE_KEY];
+    language = value === "en" ? "en" : "pl";
+  }
+
   function listenForSettingChanges() {
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area !== "local") return;
-      if (!changes[QUICK_SAVE_ENABLED_KEY]) return;
 
-      const next = changes[QUICK_SAVE_ENABLED_KEY].newValue;
-      const enabled = next === undefined ? true : Boolean(next);
-      if (enabled) {
-        mountWidget();
-      } else {
-        unmountWidget();
+      if (changes[LANGUAGE_KEY]) {
+        const nextLanguage = changes[LANGUAGE_KEY].newValue;
+        language = nextLanguage === "en" ? "en" : "pl";
+        applyLanguageTexts();
+      }
+
+      if (changes[QUICK_SAVE_ENABLED_KEY]) {
+        const next = changes[QUICK_SAVE_ENABLED_KEY].newValue;
+        const enabled = next === undefined ? true : Boolean(next);
+        if (enabled) {
+          mountWidget();
+          applyLanguageTexts();
+        } else {
+          unmountWidget();
+        }
       }
     });
   }
 
   async function init() {
-    const enabled = await isFeatureEnabled();
+    const [enabled] = await Promise.all([isFeatureEnabled(), loadLanguage()]);
     if (enabled) {
       mountWidget();
+      applyLanguageTexts();
     }
     listenForSettingChanges();
   }

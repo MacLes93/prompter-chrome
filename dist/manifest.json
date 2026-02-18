@@ -3,6 +3,11 @@
   "name": "Prompter Chrome",
   "description": "Offline manager promptow z automatycznym backupem JSON.",
   "version": "0.1.0",
+  "icons": {
+    "16": "icon-16.png",
+    "48": "icon-48.png",
+    "128": "icon-128.png"
+  },
   "options_ui": {
     "page": "options.html",
     "open_in_tab": true
@@ -20,6 +25,11 @@
     }
   ],
   "action": {
-    "default_title": "Prompter Chrome"
+    "default_title": "Prompter Chrome",
+    "default_icon": {
+      "16": "icon-16.png",
+      "48": "icon-48.png",
+      "128": "icon-128.png"
+    }
   }
 }

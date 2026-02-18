@@ -35,7 +35,8 @@ type PromptDraft = {
   favorite: boolean;
 };
 
-type AppPage = "dashboard" | "prompts" | "create" | "categories" | "data";
+type AppPage = "dashboard" | "prompts" | "create" | "categories" | "data" | "settings";
+type Language = "pl" | "en";
 
 type RouteState = {
   page: AppPage;
@@ -66,9 +67,15 @@ type LibraryApi = {
 const UNCATEGORIZED_ID = "uncategorized";
 const STORAGE_KEY = "prompter.prompts.v1";
 const QUICK_SAVE_ENABLED_KEY = "prompter.quickSaveEnabled";
+const LANGUAGE_KEY = "prompter.language";
 const SAVE_DEBOUNCE_MS = 400;
 const chromeApi = (globalThis as { chrome?: any }).chrome;
 const hasExtensionStorage = Boolean(chromeApi?.storage?.local);
+const DEFAULT_UNCATEGORIZED_LABEL = "Bez kategorii";
+
+function txt(language: Language, pl: string, en: string) {
+  return language === "pl" ? pl : en;
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -94,7 +101,7 @@ function createDraft(): PromptDraft {
 function defaultDb(): DbFile {
   return {
     version: 1,
-    categories: [{ id: UNCATEGORIZED_ID, name: "Bez kategorii", createdAt: nowIso() }],
+    categories: [{ id: UNCATEGORIZED_ID, name: DEFAULT_UNCATEGORIZED_LABEL, createdAt: nowIso() }],
     prompts: []
   };
 }
@@ -102,7 +109,7 @@ function defaultDb(): DbFile {
 function normalizeDb(input: DbFile): DbFile {
   const categories = [...(input.categories ?? [])];
   if (!categories.some((c) => c.id === UNCATEGORIZED_ID)) {
-    categories.push({ id: UNCATEGORIZED_ID, name: "Bez kategorii", createdAt: nowIso() });
+    categories.push({ id: UNCATEGORIZED_ID, name: DEFAULT_UNCATEGORIZED_LABEL, createdAt: nowIso() });
   }
 
   const categoryMap = new Map<string, Category>();
@@ -119,7 +126,7 @@ function normalizeDb(input: DbFile): DbFile {
   if (!categoryMap.has(UNCATEGORIZED_ID)) {
     categoryMap.set(UNCATEGORIZED_ID, {
       id: UNCATEGORIZED_ID,
-      name: "Bez kategorii",
+      name: DEFAULT_UNCATEGORIZED_LABEL,
       createdAt: nowIso()
     });
   }
@@ -247,7 +254,7 @@ function parseHash(): RouteState {
   const hashRaw = window.location.hash.replace(/^#/, "");
   const [pathPart, queryPart] = hashRaw.split("?");
   const page = (pathPart || "dashboard") as AppPage;
-  const validPage: AppPage = ["dashboard", "prompts", "create", "categories", "data"].includes(page)
+  const validPage: AppPage = ["dashboard", "prompts", "create", "categories", "data", "settings"].includes(page)
     ? page
     : "dashboard";
 
@@ -288,7 +295,79 @@ function useRouteState() {
   return { route, navigate };
 }
 
-function useLibrary(): LibraryApi {
+function useLanguage() {
+  const [language, setLanguage] = useState<Language>(() => {
+    const saved = localStorage.getItem(LANGUAGE_KEY);
+    return saved === "en" ? "en" : "pl";
+  });
+
+  useEffect(() => {
+    let active = true;
+
+    void (async () => {
+      if (hasExtensionStorage) {
+        const result = await chromeApi.storage.local.get([LANGUAGE_KEY]);
+        if (!active) return;
+        const value = result?.[LANGUAGE_KEY];
+        const nextLanguage: Language = value === "en" ? "en" : "pl";
+        setLanguage(nextLanguage);
+      }
+    })();
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem(LANGUAGE_KEY, language);
+    if (hasExtensionStorage) {
+      void chromeApi.storage.local.set({ [LANGUAGE_KEY]: language });
+    }
+    document.documentElement.lang = language;
+  }, [language]);
+
+  return [language, setLanguage] as const;
+}
+
+function useQuickSaveSetting() {
+  const [quickSaveEnabled, setQuickSaveEnabled] = useState(true);
+
+  useEffect(() => {
+    let active = true;
+
+    void (async () => {
+      if (hasExtensionStorage) {
+        const result = await chromeApi.storage.local.get([QUICK_SAVE_ENABLED_KEY]);
+        if (!active) return;
+        const value = result?.[QUICK_SAVE_ENABLED_KEY];
+        setQuickSaveEnabled(value === undefined ? true : Boolean(value));
+        return;
+      }
+
+      const raw = localStorage.getItem(QUICK_SAVE_ENABLED_KEY);
+      if (!active) return;
+      setQuickSaveEnabled(raw === null ? true : raw === "true");
+    })();
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  async function updateQuickSaveEnabled(next: boolean) {
+    setQuickSaveEnabled(next);
+    if (hasExtensionStorage) {
+      await chromeApi.storage.local.set({ [QUICK_SAVE_ENABLED_KEY]: next });
+      return;
+    }
+    localStorage.setItem(QUICK_SAVE_ENABLED_KEY, String(next));
+  }
+
+  return { quickSaveEnabled, updateQuickSaveEnabled };
+}
+
+function useLibrary(language: Language): LibraryApi {
   const [loading, setLoading] = useState(true);
   const [backupPending, setBackupPending] = useState(false);
   const [db, setDb] = useState<DbFile>(() => defaultDb());
@@ -336,7 +415,7 @@ function useLibrary(): LibraryApi {
     try {
       action();
     } catch (e) {
-      const message = e instanceof Error ? e.message : "Operacja nie powiodła się";
+      const message = e instanceof Error ? e.message : txt(language, "Operacja nie powiodła się", "Operation failed");
       setError(message);
     }
   }
@@ -356,9 +435,9 @@ function useLibrary(): LibraryApi {
         try {
           chromeApi.runtime?.sendMessage({ type: "BACKUP_NOW", json });
           setBackupPending(false);
-          setToast("Backup zapisany do Downloads");
+          setToast(txt(language, "Backup zapisany do Downloads", "Backup saved to Downloads"));
         } catch {
-          setError("Nie udało się utworzyć backupu pliku");
+          setError(txt(language, "Nie udało się utworzyć backupu pliku", "Could not create backup file"));
         }
         return;
       }
@@ -371,13 +450,13 @@ function useLibrary(): LibraryApi {
       link.click();
       URL.revokeObjectURL(url);
       setBackupPending(false);
-      setToast("Backup pobrany");
+      setToast(txt(language, "Backup pobrany", "Backup downloaded"));
     },
     createPrompt: createDraft,
     upsertPrompt: (draft) => {
-      if (!draft.title.trim()) throw new Error("Pole title jest wymagane");
-      if (!draft.categoryId.trim()) throw new Error("Pole categoryId jest wymagane");
-      if (!draft.content.trim()) throw new Error("Pole content jest wymagane");
+      if (!draft.title.trim()) throw new Error(txt(language, "Pole title jest wymagane", "Title is required"));
+      if (!draft.categoryId.trim()) throw new Error(txt(language, "Pole categoryId jest wymagane", "Category is required"));
+      if (!draft.content.trim()) throw new Error(txt(language, "Pole content jest wymagane", "Content is required"));
 
       const promptId = draft.id || uuid();
       withValidation(() => {
@@ -427,7 +506,7 @@ function useLibrary(): LibraryApi {
               }
             ]
           };
-        }, "Zapisano")
+        }, txt(language, "Zapisano", "Saved"))
       });
 
       return promptId;
@@ -439,7 +518,7 @@ function useLibrary(): LibraryApi {
             ...prev,
             prompts: prev.prompts.filter((p) => p.id !== id)
           }),
-          "Usunięto prompt"
+          txt(language, "Usunięto prompt", "Prompt deleted")
         );
       });
     },
@@ -448,7 +527,7 @@ function useLibrary(): LibraryApi {
       withValidation(() => {
         commit((prev) => {
           const original = prev.prompts.find((p) => p.id === id);
-          if (!original) throw new Error("Prompt nie istnieje");
+          if (!original) throw new Error(txt(language, "Prompt nie istnieje", "Prompt does not exist"));
           const now = nowIso();
 
           return {
@@ -458,14 +537,14 @@ function useLibrary(): LibraryApi {
               {
                 ...original,
                 id: copyId,
-                title: `${original.title} (kopia)`,
+                title: `${original.title} ${txt(language, "(kopia)", "(copy)")}`,
                 createdAt: now,
                 updatedAt: now,
                 lastUsedAt: null
               }
             ]
           };
-        }, "Zduplikowano");
+        }, txt(language, "Zduplikowano", "Duplicated"));
       });
 
       return copyId;
@@ -473,14 +552,14 @@ function useLibrary(): LibraryApi {
     copyPrompt: async (id) => {
       const prompt = db.prompts.find((p) => p.id === id);
       if (!prompt) {
-        setError("Prompt nie istnieje");
+        setError(txt(language, "Prompt nie istnieje", "Prompt does not exist"));
         return;
       }
 
       try {
         await navigator.clipboard.writeText(prompt.content);
       } catch {
-        setError("Nie udało się skopiować do schowka");
+        setError(txt(language, "Nie udało się skopiować do schowka", "Could not copy to clipboard"));
         return;
       }
 
@@ -494,59 +573,59 @@ function useLibrary(): LibraryApi {
             )
           };
         },
-        "Skopiowano"
+        txt(language, "Skopiowano", "Copied")
       );
     },
     createCategory: (name) => {
       withValidation(() => {
         const trimmed = name.trim();
-        if (!trimmed) throw new Error("Nazwa kategorii jest wymagana");
+        if (!trimmed) throw new Error(txt(language, "Nazwa kategorii jest wymagana", "Category name is required"));
 
         commit((prev) => {
           if (prev.categories.some((c) => c.name.toLowerCase() === trimmed.toLowerCase())) {
-            throw new Error("Kategoria o tej nazwie już istnieje");
+            throw new Error(txt(language, "Kategoria o tej nazwie już istnieje", "Category with this name already exists"));
           }
 
           return {
             ...prev,
             categories: [...prev.categories, { id: uuid(), name: trimmed, createdAt: nowIso() }]
           };
-        }, "Dodano kategorię");
+        }, txt(language, "Dodano kategorię", "Category added"));
       });
     },
     renameCategory: (id, name) => {
       withValidation(() => {
         const trimmed = name.trim();
-        if (!trimmed) throw new Error("Nazwa kategorii jest wymagana");
+        if (!trimmed) throw new Error(txt(language, "Nazwa kategorii jest wymagana", "Category name is required"));
         if (id === UNCATEGORIZED_ID) {
-          throw new Error("Nie można zmienić nazwy kategorii Bez kategorii");
+          throw new Error(txt(language, "Nie można zmienić nazwy kategorii Bez kategorii", "Cannot rename the default uncategorized category"));
         }
 
         commit((prev) => {
           if (prev.categories.some((c) => c.id !== id && c.name.toLowerCase() === trimmed.toLowerCase())) {
-            throw new Error("Kategoria o tej nazwie już istnieje");
+            throw new Error(txt(language, "Kategoria o tej nazwie już istnieje", "Category with this name already exists"));
           }
 
           if (!prev.categories.some((c) => c.id === id)) {
-            throw new Error("Kategoria nie istnieje");
+            throw new Error(txt(language, "Kategoria nie istnieje", "Category does not exist"));
           }
 
           return {
             ...prev,
             categories: prev.categories.map((c) => (c.id === id ? { ...c, name: trimmed } : c))
           };
-        }, "Zmieniono nazwę kategorii");
+        }, txt(language, "Zmieniono nazwę kategorii", "Category renamed"));
       });
     },
     deleteCategory: (id) => {
       withValidation(() => {
         if (id === UNCATEGORIZED_ID) {
-          throw new Error("Nie można usunąć kategorii Bez kategorii");
+          throw new Error(txt(language, "Nie można usunąć kategorii Bez kategorii", "Cannot delete the default uncategorized category"));
         }
 
         commit((prev) => {
           if (!prev.categories.some((c) => c.id === id)) {
-            throw new Error("Kategoria nie istnieje");
+            throw new Error(txt(language, "Kategoria nie istnieje", "Category does not exist"));
           }
           return {
             ...prev,
@@ -555,7 +634,7 @@ function useLibrary(): LibraryApi {
               p.categoryId === id ? { ...p, categoryId: UNCATEGORIZED_ID, updatedAt: nowIso() } : p
             )
           };
-        }, "Usunięto kategorię");
+        }, txt(language, "Usunięto kategorię", "Category deleted"));
       });
     },
     exportJson: () => JSON.stringify(db, null, 2),
@@ -563,18 +642,19 @@ function useLibrary(): LibraryApi {
       withValidation(() => {
         const parsed = JSON.parse(raw) as DbFile;
         const normalizedImported = normalizeDb(parsed);
-        commit((prev) => mergeImported(prev, normalizedImported), "Zaimportowano dane");
+        commit((prev) => mergeImported(prev, normalizedImported), txt(language, "Zaimportowano dane", "Imported data"));
       });
     }
   };
 }
 
-function pageTitle(page: AppPage) {
-  if (page === "dashboard") return "Dashboard";
-  if (page === "prompts") return "Biblioteka promptów";
-  if (page === "create") return "Nowy prompt";
-  if (page === "categories") return "Kategorie";
-  if (page === "data") return "Dane i kopie";
+function pageTitle(page: AppPage, language: Language) {
+  if (page === "dashboard") return language === "pl" ? "Dashboard" : "Dashboard";
+  if (page === "prompts") return language === "pl" ? "Biblioteka promptów" : "Prompt library";
+  if (page === "create") return language === "pl" ? "Nowy prompt" : "New prompt";
+  if (page === "categories") return language === "pl" ? "Kategorie" : "Categories";
+  if (page === "data") return language === "pl" ? "Dane i kopie" : "Data and backups";
+  if (page === "settings") return language === "pl" ? "Ustawienia" : "Settings";
   return "Prompter";
 }
 
@@ -596,7 +676,16 @@ function NavButton({
   );
 }
 
-function DashboardPage({ db, navigate }: { db: DbFile; navigate: (page: AppPage, params?: Record<string, string>) => void; }) {
+function DashboardPage({
+  db,
+  navigate,
+  language
+}: {
+  db: DbFile;
+  navigate: (page: AppPage, params?: Record<string, string>) => void;
+  language: Language;
+}) {
+  const isPl = language === "pl";
   const recent = [...db.prompts]
     .sort((a, b) => {
       if (a.lastUsedAt && b.lastUsedAt) {
@@ -622,26 +711,26 @@ function DashboardPage({ db, navigate }: { db: DbFile; navigate: (page: AppPage,
 
   return (
     <div className="dashboard-grid">
-      <article className="metric-card"><h3>Łącznie promptów</h3><strong>{db.prompts.length}</strong></article>
-      <article className="metric-card"><h3>Ulubione</h3><strong>{db.prompts.filter((p) => p.favorite).length}</strong></article>
-      <article className="metric-card"><h3>Kategorie</h3><strong>{db.categories.length}</strong></article>
-      <article className="metric-card"><h3>Aktywne tagi</h3><strong>{new Set(db.prompts.flatMap((p) => p.tags)).size}</strong></article>
+      <article className="metric-card"><h3>{isPl ? "Łącznie promptów" : "Total prompts"}</h3><strong>{db.prompts.length}</strong></article>
+      <article className="metric-card"><h3>{isPl ? "Ulubione" : "Favorites"}</h3><strong>{db.prompts.filter((p) => p.favorite).length}</strong></article>
+      <article className="metric-card"><h3>{isPl ? "Kategorie" : "Categories"}</h3><strong>{db.categories.length}</strong></article>
+      <article className="metric-card"><h3>{isPl ? "Aktywne tagi" : "Active tags"}</h3><strong>{new Set(db.prompts.flatMap((p) => p.tags)).size}</strong></article>
 
       <section className="surface recent-panel">
         <div className="section-title-row">
-          <h2>Ostatnio używane</h2>
-          <button className="ghost" onClick={() => navigate("prompts")}>Zobacz wszystkie</button>
+          <h2>{isPl ? "Ostatnio używane" : "Recently used"}</h2>
+          <button className="ghost" onClick={() => navigate("prompts")}>{isPl ? "Zobacz wszystkie" : "View all"}</button>
         </div>
-        {recent.length === 0 ? <p>Brak używanych promptów.</p> : recent.map((prompt) => (
+        {recent.length === 0 ? <p>{isPl ? "Brak używanych promptów." : "No recently used prompts."}</p> : recent.map((prompt) => (
           <button key={prompt.id} className="list-item" onClick={() => navigate("prompts", { prompt: prompt.id })}>
             <span>{prompt.title}</span>
-            <small>{prompt.lastUsedAt ? new Date(prompt.lastUsedAt).toLocaleString() : "nigdy"}</small>
+            <small>{prompt.lastUsedAt ? new Date(prompt.lastUsedAt).toLocaleString() : (isPl ? "nigdy" : "never")}</small>
           </button>
         ))}
       </section>
 
       <section className="surface tags-panel">
-        <h2>Najczęstsze tagi</h2>
+        <h2>{isPl ? "Najczęstsze tagi" : "Top tags"}</h2>
         <div className="tag-cloud">
           {topTags.map(([tag, count]) => (
             <button key={tag} className="tag-pill" onClick={() => navigate("prompts", { tag })}>
@@ -658,13 +747,17 @@ function PromptsPage({
   lib,
   params,
   clearParams,
-  navigate
+  navigate,
+  language
 }: {
   lib: LibraryApi;
   params: URLSearchParams;
   clearParams: () => void;
   navigate: (page: AppPage, params?: Record<string, string>) => void;
+  language: Language;
 }) {
+  const isPl = language === "pl";
+  const locale = isPl ? "pl" : "en";
   const searchRef = useRef<HTMLInputElement>(null);
 
   const [search, setSearch] = useState("");
@@ -733,8 +826,8 @@ function PromptsPage({
     for (const prompt of prompts) {
       for (const tag of prompt.tags) unique.add(tag);
     }
-    return Array.from(unique).sort((a, b) => a.localeCompare(b, "pl", { sensitivity: "base" }));
-  }, [prompts]);
+    return Array.from(unique).sort((a, b) => a.localeCompare(b, locale, { sensitivity: "base" }));
+  }, [locale, prompts]);
 
   const visibleTags = useMemo(() => {
     const query = tagSearch.trim().toLowerCase();
@@ -754,7 +847,7 @@ function PromptsPage({
 
     const sorted = [...list];
     if (sortMode === "newest") sorted.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-    if (sortMode === "az") sorted.sort((a, b) => a.title.localeCompare(b.title, "pl", { sensitivity: "base" }));
+    if (sortMode === "az") sorted.sort((a, b) => a.title.localeCompare(b.title, locale, { sensitivity: "base" }));
     if (sortMode === "lastUsed") {
       sorted.sort((a, b) => {
         if (a.lastUsedAt && b.lastUsedAt) return new Date(b.lastUsedAt).getTime() - new Date(a.lastUsedAt).getTime();
@@ -765,7 +858,7 @@ function PromptsPage({
     }
 
     return sorted;
-  }, [favoriteOnly, prompts, search, selectedCategory, selectedTags, sortMode]);
+  }, [favoriteOnly, locale, prompts, search, selectedCategory, selectedTags, sortMode]);
 
   const selectedPrompt = useMemo(
     () => prompts.find((prompt) => prompt.id === selectedPromptId) ?? null,
@@ -776,33 +869,33 @@ function PromptsPage({
     <div className="library-page">
       <section className="library-hero">
         <div>
-          <h2>Prompts Library</h2>
-          <p>Browse and search through your prompt templates</p>
+          <h2>{isPl ? "Biblioteka promptów" : "Prompts Library"}</h2>
+          <p>{isPl ? "Przeglądaj i wyszukuj swoje szablony promptów" : "Browse and search through your prompt templates"}</p>
         </div>
         <div className="library-controls">
           <label>
-            Collection
+            {isPl ? "Kolekcja" : "Collection"}
             <select value={selectedCategory} onChange={(e) => setSelectedCategory(e.target.value)}>
-              <option value="all">All Collections</option>
+              <option value="all">{isPl ? "Wszystkie kolekcje" : "All collections"}</option>
               {categories.map((category) => (
                 <option key={category.id} value={category.id}>
-                  {category.name}
+                  {category.id === UNCATEGORIZED_ID ? (isPl ? "Bez kategorii" : "Uncategorized") : category.name}
                 </option>
               ))}
             </select>
           </label>
           <label>
-            Sort
+            {isPl ? "Sortowanie" : "Sort"}
             <select value={sortMode} onChange={(e) => setSortMode(e.target.value as SortMode)}>
-              <option value="newest">Najnowsze</option>
-              <option value="lastUsed">Ostatnio używane</option>
+              <option value="newest">{isPl ? "Najnowsze" : "Newest"}</option>
+              <option value="lastUsed">{isPl ? "Ostatnio używane" : "Last used"}</option>
               <option value="az">A-Z</option>
             </select>
           </label>
           <button className={favoriteOnly ? "ghost active-filter" : "ghost"} onClick={() => setFavoriteOnly((v) => !v)}>
-            ⭐ Ulubione
+            ⭐ {isPl ? "Ulubione" : "Favorites"}
           </button>
-          <button onClick={() => navigate("create")}>+ Add Prompt</button>
+          <button onClick={() => navigate("create")}>{isPl ? "+ Dodaj prompt" : "+ Add prompt"}</button>
         </div>
       </section>
 
@@ -812,13 +905,13 @@ function PromptsPage({
           className="library-search"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
-          placeholder="Search prompts... (Ctrl/Cmd+K)"
+          placeholder={isPl ? "Szukaj promptów... (Ctrl/Cmd+K)" : "Search prompts... (Ctrl/Cmd+K)"}
         />
         <input
           className="tag-search"
           value={tagSearch}
           onChange={(e) => setTagSearch(e.target.value)}
-          placeholder="Search tags..."
+          placeholder={isPl ? "Szukaj tagów..." : "Search tags..."}
         />
         <div className="library-tags">
           {visibleTags.map((tag) => (
@@ -834,7 +927,7 @@ function PromptsPage({
               {tag}
             </button>
           ))}
-          {visibleTags.length === 0 ? <span className="chip">Brak tagów</span> : null}
+          {visibleTags.length === 0 ? <span className="chip">{isPl ? "Brak tagów" : "No tags"}</span> : null}
         </div>
       </section>
 
@@ -850,7 +943,11 @@ function PromptsPage({
               {prompt.favorite ? <span>⭐</span> : null}
             </div>
             <div className="tag-cloud">
-              <span className="chip">{categoryMap.get(prompt.categoryId) ?? "Bez kategorii"}</span>
+              <span className="chip">
+                {prompt.categoryId === UNCATEGORIZED_ID
+                  ? (isPl ? "Bez kategorii" : "Uncategorized")
+                  : (categoryMap.get(prompt.categoryId) ?? (isPl ? "Bez kategorii" : "Uncategorized"))}
+              </span>
               {prompt.tags.slice(0, 2).map((tag) => (
                 <span key={tag} className="chip chip-purple">
                   {tag}
@@ -858,10 +955,10 @@ function PromptsPage({
               ))}
             </div>
             <p>{prompt.content.slice(0, 170)}{prompt.content.length > 170 ? "..." : ""}</p>
-            <small>Updated: {new Date(prompt.updatedAt).toLocaleDateString()}</small>
+            <small>{isPl ? "Aktualizacja" : "Updated"}: {new Date(prompt.updatedAt).toLocaleDateString()}</small>
           </article>
         ))}
-        {filteredPrompts.length === 0 ? <div className="surface">Brak wyników dla aktualnych filtrów.</div> : null}
+        {filteredPrompts.length === 0 ? <div className="surface">{isPl ? "Brak wyników dla aktualnych filtrów." : "No results for current filters."}</div> : null}
       </section>
 
       {selectedPrompt ? (
@@ -869,11 +966,15 @@ function PromptsPage({
           <article className="prompt-preview" onClick={(event) => event.stopPropagation()}>
             <div className="row-between">
               <h2>{selectedPrompt.title}</h2>
-              <button className="ghost" onClick={() => setSelectedPromptId(null)}>Zamknij</button>
+              <button className="ghost" onClick={() => setSelectedPromptId(null)}>{isPl ? "Zamknij" : "Close"}</button>
             </div>
 
             <div className="tag-cloud">
-              <span className="chip">{categoryMap.get(selectedPrompt.categoryId) ?? "Bez kategorii"}</span>
+              <span className="chip">
+                {selectedPrompt.categoryId === UNCATEGORIZED_ID
+                  ? (isPl ? "Bez kategorii" : "Uncategorized")
+                  : (categoryMap.get(selectedPrompt.categoryId) ?? (isPl ? "Bez kategorii" : "Uncategorized"))}
+              </span>
               {selectedPrompt.tags.map((tag) => (
                 <span key={tag} className="chip chip-purple">{tag}</span>
               ))}
@@ -882,8 +983,8 @@ function PromptsPage({
             <pre>{selectedPrompt.content}</pre>
 
             <div className="row-gap">
-              <button onClick={() => void lib.copyPrompt(selectedPrompt.id)}>Kopiuj</button>
-              <button className="ghost" onClick={() => navigate("create", { id: selectedPrompt.id })}>Edytuj</button>
+              <button onClick={() => void lib.copyPrompt(selectedPrompt.id)}>{isPl ? "Kopiuj" : "Copy"}</button>
+              <button className="ghost" onClick={() => navigate("create", { id: selectedPrompt.id })}>{isPl ? "Edytuj" : "Edit"}</button>
               <button
                 className="ghost"
                 onClick={() => {
@@ -891,7 +992,7 @@ function PromptsPage({
                   setSelectedPromptId(copyId);
                 }}
               >
-                Duplikuj
+                {isPl ? "Duplikuj" : "Duplicate"}
               </button>
               <button
                 className="danger"
@@ -900,7 +1001,7 @@ function PromptsPage({
                   setSelectedPromptId(null);
                 }}
               >
-                Usuń
+                {isPl ? "Usuń" : "Delete"}
               </button>
             </div>
           </article>
@@ -913,12 +1014,16 @@ function PromptsPage({
 function CreatePromptPage({
   lib,
   params,
-  navigate
+  navigate,
+  language
 }: {
   lib: LibraryApi;
   params: URLSearchParams;
   navigate: (page: AppPage, params?: Record<string, string>) => void;
+  language: Language;
 }) {
+  const isPl = language === "pl";
+  const locale = isPl ? "pl" : "en";
   const editId = params.get("id");
   const editingPrompt = useMemo(
     () => (editId ? lib.db.prompts.find((prompt) => prompt.id === editId) ?? null : null),
@@ -949,8 +1054,8 @@ function CreatePromptPage({
     for (const prompt of lib.db.prompts) {
       for (const tag of prompt.tags) unique.add(tag);
     }
-    return Array.from(unique).sort((a, b) => a.localeCompare(b, "pl", { sensitivity: "base" }));
-  }, [lib.db.prompts]);
+    return Array.from(unique).sort((a, b) => a.localeCompare(b, locale, { sensitivity: "base" }));
+  }, [lib.db.prompts, locale]);
 
   function addTag() {
     const tag = newTagInput.trim();
@@ -975,13 +1080,13 @@ function CreatePromptPage({
   return (
     <section className="surface create-page">
       <div className="section-title-row">
-        <h2>{editingPrompt ? "Edytuj prompt" : "Nowy prompt"}</h2>
-        <button className="ghost" onClick={() => navigate("prompts")}>Wróć do biblioteki</button>
+        <h2>{editingPrompt ? (isPl ? "Edytuj prompt" : "Edit prompt") : (isPl ? "Nowy prompt" : "New prompt")}</h2>
+        <button className="ghost" onClick={() => navigate("prompts")}>{isPl ? "Wróć do biblioteki" : "Back to library"}</button>
       </div>
 
       <form className="editor-form" onSubmit={onSubmit}>
         <label>
-          Tytuł *
+          {isPl ? "Tytuł" : "Title"} *
           <input
             value={draft.title}
             onChange={(e) => setDraft((prev) => ({ ...prev, title: e.target.value }))}
@@ -990,19 +1095,21 @@ function CreatePromptPage({
         </label>
 
         <label>
-          Kategoria *
+          {isPl ? "Kategoria" : "Category"} *
           <select
             value={draft.categoryId}
             onChange={(e) => setDraft((prev) => ({ ...prev, categoryId: e.target.value }))}
           >
             {lib.db.categories.map((category) => (
-              <option key={category.id} value={category.id}>{category.name}</option>
+              <option key={category.id} value={category.id}>
+                {category.id === UNCATEGORIZED_ID ? (isPl ? "Bez kategorii" : "Uncategorized") : category.name}
+              </option>
             ))}
           </select>
         </label>
 
         <label>
-          Treść *
+          {isPl ? "Treść" : "Content"} *
           <textarea
             value={draft.content}
             onChange={(e) => setDraft((prev) => ({ ...prev, content: e.target.value }))}
@@ -1017,11 +1124,11 @@ function CreatePromptPage({
             checked={draft.favorite}
             onChange={(e) => setDraft((prev) => ({ ...prev, favorite: e.target.checked }))}
           />
-          Ulubiony
+          {isPl ? "Ulubiony" : "Favorite"}
         </label>
 
         <label>
-          Tagi
+          {isPl ? "Tagi" : "Tags"}
           <div className="row-gap">
             <input
               value={newTagInput}
@@ -1033,9 +1140,9 @@ function CreatePromptPage({
                 }
               }}
               list="all-tags-create"
-              placeholder="Wpisz tag i Enter"
+              placeholder={isPl ? "Wpisz tag i Enter" : "Type a tag and press Enter"}
             />
-            <button type="button" className="ghost" onClick={addTag}>Dodaj tag</button>
+            <button type="button" className="ghost" onClick={addTag}>{isPl ? "Dodaj tag" : "Add tag"}</button>
           </div>
           <datalist id="all-tags-create">
             {tagsUniverse.map((tag) => <option key={tag} value={tag} />)}
@@ -1051,7 +1158,9 @@ function CreatePromptPage({
         </div>
 
         <div className="row-gap">
-          <button type="submit">{editingPrompt ? "Zapisz zmiany" : "Dodaj prompt"}</button>
+          <button type="submit">
+            {editingPrompt ? (isPl ? "Zapisz zmiany" : "Save changes") : (isPl ? "Dodaj prompt" : "Add prompt")}
+          </button>
           {editingPrompt ? (
             <button
               type="button"
@@ -1061,7 +1170,7 @@ function CreatePromptPage({
                 navigate("prompts");
               }}
             >
-              Usuń prompt
+              {isPl ? "Usuń prompt" : "Delete prompt"}
             </button>
           ) : null}
         </div>
@@ -1070,7 +1179,8 @@ function CreatePromptPage({
   );
 }
 
-function CategoriesPage({ lib }: { lib: LibraryApi }) {
+function CategoriesPage({ lib, language }: { lib: LibraryApi; language: Language }) {
+  const isPl = language === "pl";
   const [newName, setNewName] = useState("");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
@@ -1087,10 +1197,10 @@ function CategoriesPage({ lib }: { lib: LibraryApi }) {
   return (
     <div className="surface">
       <div className="section-title-row">
-        <h2>Zarządzanie kategoriami</h2>
+        <h2>{isPl ? "Zarządzanie kategoriami" : "Manage categories"}</h2>
         <div className="row-gap">
-          <input value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="Nowa kategoria" />
-          <button onClick={() => { lib.createCategory(newName); setNewName(""); }}>Dodaj</button>
+          <input value={newName} onChange={(e) => setNewName(e.target.value)} placeholder={isPl ? "Nowa kategoria" : "New category"} />
+          <button onClick={() => { lib.createCategory(newName); setNewName(""); }}>{isPl ? "Dodaj" : "Add"}</button>
         </div>
       </div>
 
@@ -1101,23 +1211,23 @@ function CategoriesPage({ lib }: { lib: LibraryApi }) {
               <>
                 <input value={editingName} onChange={(e) => setEditingName(e.target.value)} />
                 <div className="row-gap">
-                  <button className="ghost" onClick={() => { lib.renameCategory(category.id, editingName); setEditingId(null); setEditingName(""); }}>Zapisz</button>
-                  <button className="ghost" onClick={() => { setEditingId(null); setEditingName(""); }}>Anuluj</button>
+                  <button className="ghost" onClick={() => { lib.renameCategory(category.id, editingName); setEditingId(null); setEditingName(""); }}>{isPl ? "Zapisz" : "Save"}</button>
+                  <button className="ghost" onClick={() => { setEditingId(null); setEditingName(""); }}>{isPl ? "Anuluj" : "Cancel"}</button>
                 </div>
               </>
             ) : (
               <>
-                <h3>{category.name}</h3>
-                <p>{counts.get(category.id) || 0} promptów</p>
-                <small>Utworzono: {new Date(category.createdAt).toLocaleDateString()}</small>
+                <h3>{category.id === UNCATEGORIZED_ID ? (isPl ? "Bez kategorii" : "Uncategorized") : category.name}</h3>
+                <p>{counts.get(category.id) || 0} {isPl ? "promptów" : "prompts"}</p>
+                <small>{isPl ? "Utworzono" : "Created"}: {new Date(category.createdAt).toLocaleDateString()}</small>
                 <div className="row-gap">
                   {category.id !== UNCATEGORIZED_ID ? (
                     <>
-                      <button className="ghost" onClick={() => { setEditingId(category.id); setEditingName(category.name); }}>Zmień nazwę</button>
-                      <button className="danger" onClick={() => lib.deleteCategory(category.id)}>Usuń</button>
+                      <button className="ghost" onClick={() => { setEditingId(category.id); setEditingName(category.name); }}>{isPl ? "Zmień nazwę" : "Rename"}</button>
+                      <button className="danger" onClick={() => lib.deleteCategory(category.id)}>{isPl ? "Usuń" : "Delete"}</button>
                     </>
                   ) : (
-                    <button className="ghost" disabled>Kategoria systemowa</button>
+                    <button className="ghost" disabled>{isPl ? "Kategoria systemowa" : "System category"}</button>
                   )}
                 </div>
               </>
@@ -1129,35 +1239,13 @@ function CategoriesPage({ lib }: { lib: LibraryApi }) {
   );
 }
 
-function DataPage({ lib }: { lib: LibraryApi }) {
+function DataPage({ lib, language }: { lib: LibraryApi; language: Language }) {
+  const isPl = language === "pl";
   const fileRef = useRef<HTMLInputElement>(null);
   const [importPreview, setImportPreview] = useState<DbFile | null>(null);
   const [selectedImportIds, setSelectedImportIds] = useState<string[]>([]);
   const [importFileName, setImportFileName] = useState("");
   const [importError, setImportError] = useState<string | null>(null);
-  const [quickSaveEnabled, setQuickSaveEnabled] = useState(true);
-
-  useEffect(() => {
-    let active = true;
-
-    void (async () => {
-      if (hasExtensionStorage) {
-        const result = await chromeApi.storage.local.get([QUICK_SAVE_ENABLED_KEY]);
-        if (!active) return;
-        const value = result?.[QUICK_SAVE_ENABLED_KEY];
-        setQuickSaveEnabled(value === undefined ? true : Boolean(value));
-        return;
-      }
-
-      const raw = localStorage.getItem(QUICK_SAVE_ENABLED_KEY);
-      if (!active) return;
-      setQuickSaveEnabled(raw === null ? true : raw === "true");
-    })();
-
-    return () => {
-      active = false;
-    };
-  }, []);
 
   function downloadExport() {
     const blob = new Blob([lib.exportJson()], { type: "application/json" });
@@ -1187,7 +1275,7 @@ function DataPage({ lib }: { lib: LibraryApi }) {
       setImportPreview(normalized);
       setSelectedImportIds(defaultSelection);
     } catch {
-      setImportError("Niepoprawny plik JSON");
+      setImportError(isPl ? "Niepoprawny plik JSON" : "Invalid JSON file");
       setImportPreview(null);
       setSelectedImportIds([]);
       setImportFileName("");
@@ -1202,7 +1290,7 @@ function DataPage({ lib }: { lib: LibraryApi }) {
       selectedImportIds.includes(prompt.id)
     );
     if (selectedPrompts.length === 0) {
-      setImportError("Wybierz co najmniej jeden prompt");
+      setImportError(isPl ? "Wybierz co najmniej jeden prompt" : "Select at least one prompt");
       return;
     }
 
@@ -1235,26 +1323,18 @@ function DataPage({ lib }: { lib: LibraryApi }) {
   const selectedCount = selectedImportIds.length;
   const previewCount = importPreview?.prompts.length ?? 0;
 
-  async function onQuickSaveToggle(next: boolean) {
-    setQuickSaveEnabled(next);
-    if (hasExtensionStorage) {
-      await chromeApi.storage.local.set({ [QUICK_SAVE_ENABLED_KEY]: next });
-      return;
-    }
-    localStorage.setItem(QUICK_SAVE_ENABLED_KEY, String(next));
-  }
-
   return (
     <div className="data-layout">
       <section className="surface">
-        <h2>Import / Export</h2>
+        <h2>{isPl ? "Import / Eksport" : "Import / Export"}</h2>
         <p>
-          Export zapisuje pełny JSON biblioteki. Import scala dane: aktualizuje prompty o tym samym
-          `id`, tworzy brakujące i dopasowuje kategorie po `id` i nazwie.
+          {isPl
+            ? "Export zapisuje pełny JSON biblioteki. Import scala dane: aktualizuje prompty o tym samym `id`, tworzy brakujące i dopasowuje kategorie po `id` i nazwie."
+            : "Export saves the full library JSON. Import merges data: updates prompts with the same `id`, creates missing ones, and matches categories by `id` and name."}
         </p>
         <div className="row-gap">
-          <button onClick={downloadExport}>Export JSON</button>
-          <button className="ghost" onClick={() => fileRef.current?.click()}>Import JSON</button>
+          <button onClick={downloadExport}>{isPl ? "Eksport JSON" : "Export JSON"}</button>
+          <button className="ghost" onClick={() => fileRef.current?.click()}>{isPl ? "Import JSON" : "Import JSON"}</button>
           <input ref={fileRef} type="file" accept="application/json,.json" onChange={onFileImport} hidden />
         </div>
         {importError ? <p className="import-error">{importError}</p> : null}
@@ -1263,15 +1343,15 @@ function DataPage({ lib }: { lib: LibraryApi }) {
       {importPreview ? (
         <section className="surface import-preview">
           <div className="section-title-row">
-            <h2>Podgląd importu: {importFileName}</h2>
-            <small>{selectedCount} / {previewCount} zaznaczone</small>
+            <h2>{isPl ? "Podgląd importu" : "Import preview"}: {importFileName}</h2>
+            <small>{selectedCount} / {previewCount} {isPl ? "zaznaczone" : "selected"}</small>
           </div>
           <div className="row-gap">
             <button
               className="ghost"
               onClick={() => setSelectedImportIds(importPreview.prompts.map((prompt) => prompt.id))}
             >
-              Zaznacz wszystko
+              {isPl ? "Zaznacz wszystko" : "Select all"}
             </button>
             <button
               className="ghost"
@@ -1283,12 +1363,12 @@ function DataPage({ lib }: { lib: LibraryApi }) {
                 )
               }
             >
-              Tylko nowe
+              {isPl ? "Tylko nowe" : "Only new"}
             </button>
             <button className="ghost" onClick={() => setSelectedImportIds([])}>
-              Wyczyść
+              {isPl ? "Wyczyść" : "Clear"}
             </button>
-            <button onClick={applySelectedImport}>Importuj zaznaczone</button>
+            <button onClick={applySelectedImport}>{isPl ? "Importuj zaznaczone" : "Import selected"}</button>
           </div>
 
           <div className="import-list">
@@ -1312,7 +1392,7 @@ function DataPage({ lib }: { lib: LibraryApi }) {
                     <div className="row-between">
                       <strong>{prompt.title}</strong>
                       <span className={isUpdate ? "import-badge update" : "import-badge new"}>
-                        {isUpdate ? "aktualizacja" : "nowy"}
+                        {isUpdate ? (isPl ? "aktualizacja" : "update") : (isPl ? "nowy" : "new")}
                       </span>
                     </div>
                     <p>{prompt.content.slice(0, 120)}{prompt.content.length > 120 ? "..." : ""}</p>
@@ -1325,52 +1405,91 @@ function DataPage({ lib }: { lib: LibraryApi }) {
       ) : null}
 
       <section className="surface">
-        <h2>Jak działa import</h2>
+        <h2>{isPl ? "Jak działa import" : "How import works"}</h2>
         <ul className="stats-list">
-          <li>wybierasz plik,</li>
-          <li>zaznaczasz prompty do dociągnięcia,</li>
-          <li>importuje tylko zaznaczone rekordy.</li>
+          <li>{isPl ? "wybierasz plik," : "choose a file,"}</li>
+          <li>{isPl ? "zaznaczasz prompty do dociągnięcia," : "select prompts to import,"}</li>
+          <li>{isPl ? "importuje tylko zaznaczone rekordy." : "only selected records are imported."}</li>
         </ul>
       </section>
 
       <section className="surface">
-        <h2>Podsumowanie danych</h2>
+        <h2>{isPl ? "Podsumowanie danych" : "Data summary"}</h2>
         <ul className="stats-list">
-          <li>Wersja formatu: {lib.db.version}</li>
-          <li>Liczba promptów: {lib.db.prompts.length}</li>
-          <li>Liczba kategorii: {lib.db.categories.length}</li>
-          <li>Unikalne tagi: {new Set(lib.db.prompts.flatMap((p) => p.tags)).size}</li>
+          <li>{isPl ? "Wersja formatu" : "Format version"}: {lib.db.version}</li>
+          <li>{isPl ? "Liczba promptów" : "Prompts count"}: {lib.db.prompts.length}</li>
+          <li>{isPl ? "Liczba kategorii" : "Categories count"}: {lib.db.categories.length}</li>
+          <li>{isPl ? "Unikalne tagi" : "Unique tags"}: {new Set(lib.db.prompts.flatMap((p) => p.tags)).size}</li>
         </ul>
       </section>
 
       <section className="surface">
-        <h2>Integracje stron</h2>
-        <label className="checkbox-row">
-          <input
-            type="checkbox"
-            checked={quickSaveEnabled}
-            onChange={(event) => void onQuickSaveToggle(event.target.checked)}
-          />
-          Pokazuj przycisk `Save to Prompter` na ChatGPT i Claude
-        </label>
-      </section>
-
-      <section className="surface">
-        <h2>Skróty klawiszowe</h2>
+        <h2>{isPl ? "Skróty klawiszowe" : "Keyboard shortcuts"}</h2>
         <ul className="stats-list">
-          <li>Ctrl/Cmd + K: fokus na wyszukiwarce (na stronie promptów)</li>
-          <li>Ctrl/Cmd + N: nowy prompt (na stronie promptów)</li>
-          <li>Ctrl/Cmd + Enter: kopiuj aktualny prompt (na stronie promptów)</li>
+          <li>{isPl ? "Ctrl/Cmd + K: fokus na wyszukiwarce (na stronie promptów)" : "Ctrl/Cmd + K: focus search (on prompts page)"}</li>
+          <li>{isPl ? "Ctrl/Cmd + N: nowy prompt (na stronie promptów)" : "Ctrl/Cmd + N: new prompt (on prompts page)"}</li>
+          <li>{isPl ? "Ctrl/Cmd + Enter: kopiuj aktualny prompt (na stronie promptów)" : "Ctrl/Cmd + Enter: copy current prompt (on prompts page)"}</li>
         </ul>
       </section>
     </div>
   );
 }
 
+function SettingsPage({
+  language,
+  onLanguageChange,
+  quickSaveEnabled,
+  onQuickSaveToggle
+}: {
+  language: Language;
+  onLanguageChange: (next: Language) => void;
+  quickSaveEnabled: boolean;
+  onQuickSaveToggle: (next: boolean) => Promise<void>;
+}) {
+  const isPl = language === "pl";
+
+  return (
+    <div className="data-layout">
+      <section className="surface">
+        <h2>{isPl ? "Język" : "Language"}</h2>
+        <p>{isPl ? "Wybierz język interfejsu rozszerzenia." : "Choose the extension interface language."}</p>
+        <div className="row-gap">
+          <label htmlFor="language-select-settings">{isPl ? "Język" : "Language"}</label>
+          <select
+            id="language-select-settings"
+            value={language}
+            onChange={(event) => onLanguageChange(event.target.value as Language)}
+          >
+            <option value="pl">Polski</option>
+            <option value="en">English</option>
+          </select>
+        </div>
+      </section>
+
+      <section className="surface">
+        <h2>{isPl ? "Integracje stron" : "Site integrations"}</h2>
+        <label className="checkbox-row">
+          <input
+            type="checkbox"
+            checked={quickSaveEnabled}
+            onChange={(event) => void onQuickSaveToggle(event.target.checked)}
+          />
+          {isPl
+            ? "Pokazuj przycisk `Save to Prompter` na ChatGPT i Claude"
+            : "Show the `Save to Prompter` button on ChatGPT and Claude"}
+        </label>
+      </section>
+    </div>
+  );
+}
+
 function App() {
-  const lib = useLibrary();
+  const [language, setLanguage] = useLanguage();
+  const { quickSaveEnabled, updateQuickSaveEnabled } = useQuickSaveSetting();
+  const lib = useLibrary(language);
   const { route, navigate } = useRouteState();
   const [backupNoticeOpen, setBackupNoticeOpen] = useState(false);
+  const isPl = language === "pl";
 
   useEffect(() => {
     if (!lib.backupPending) {
@@ -1382,7 +1501,9 @@ function App() {
     return (
       <div className="shell">
         <section className="workspace">
-          <div className="surface">Ładowanie danych rozszerzenia...</div>
+          <div className="surface">
+            {isPl ? "Ładowanie danych rozszerzenia..." : "Loading extension data..."}
+          </div>
         </section>
       </div>
     );
@@ -1395,50 +1516,75 @@ function App() {
           <div className="brand-dot" />
           <div>
             <strong>Prompter</strong>
-            <small>offline workspace</small>
+            <small>{isPl ? "workspace offline" : "offline workspace"}</small>
           </div>
         </div>
 
         <nav className="nav-links">
           <NavButton page="dashboard" current={route.page} onClick={(page) => navigate(page)}>Dashboard</NavButton>
-          <NavButton page="prompts" current={route.page} onClick={(page) => navigate(page)}>Prompty</NavButton>
-          <NavButton page="create" current={route.page} onClick={(page) => navigate(page)}>Nowy prompt</NavButton>
-          <NavButton page="categories" current={route.page} onClick={(page) => navigate(page)}>Kategorie</NavButton>
-          <NavButton page="data" current={route.page} onClick={(page) => navigate(page)}>Dane</NavButton>
+          <NavButton page="prompts" current={route.page} onClick={(page) => navigate(page)}>
+            {isPl ? "Prompty" : "Prompts"}
+          </NavButton>
+          <NavButton page="create" current={route.page} onClick={(page) => navigate(page)}>
+            {isPl ? "Nowy prompt" : "New prompt"}
+          </NavButton>
+          <NavButton page="categories" current={route.page} onClick={(page) => navigate(page)}>
+            {isPl ? "Kategorie" : "Categories"}
+          </NavButton>
+          <NavButton page="data" current={route.page} onClick={(page) => navigate(page)}>
+            {isPl ? "Dane" : "Data"}
+          </NavButton>
+          <NavButton page="settings" current={route.page} onClick={(page) => navigate(page)}>
+            {isPl ? "Ustawienia" : "Settings"}
+          </NavButton>
         </nav>
 
         <div className="sidebar-card">
-          <p>{lib.db.prompts.length} promptów</p>
-          <p>{lib.db.categories.length} kategorii</p>
-          <p>{lib.db.prompts.filter((p) => p.favorite).length} ulubionych</p>
+          <p>
+            {lib.db.prompts.length} {isPl ? "promptów" : "prompts"}
+          </p>
+          <p>
+            {lib.db.categories.length} {isPl ? "kategorii" : "categories"}
+          </p>
+          <p>
+            {lib.db.prompts.filter((p) => p.favorite).length} {isPl ? "ulubionych" : "favorites"}
+          </p>
         </div>
       </aside>
 
       <section className="workspace">
         <header className="page-header">
           <div>
-            <h1>{pageTitle(route.page)}</h1>
-            <p>Nowoczesna organizacja promptów z szybkim dostępem i filtrowaniem.</p>
+            <h1>{pageTitle(route.page, language)}</h1>
+            <p>
+              {isPl
+                ? "Nowoczesna organizacja promptów z szybkim dostępem i filtrowaniem."
+                : "Modern prompt organization with fast access and filtering."}
+            </p>
           </div>
           <div className="header-actions">
-            <button onClick={() => navigate("create")}>+ Nowy prompt</button>
-            <button className="ghost" onClick={() => navigate("data")}>Import / Export</button>
+            <button onClick={() => navigate("create")}>{isPl ? "+ Nowy prompt" : "+ New prompt"}</button>
+            <button className="ghost" onClick={() => navigate("data")}>{isPl ? "Import / Export" : "Import / Export"}</button>
           </div>
         </header>
 
         {lib.backupPending ? (
           <div className="backup-notice" onClick={() => setBackupNoticeOpen((prev) => !prev)}>
             <div>
-              <strong>Masz niezbackupowane zmiany.</strong>
-              <span>Kliknij, aby zapisać plik backupu JSON.</span>
+              <strong>
+                {isPl ? "Masz niezbackupowane zmiany." : "You have unbacked-up changes."}
+              </strong>
+              <span>
+                {isPl ? "Kliknij, aby zapisać plik backupu JSON." : "Click to save a JSON backup file."}
+              </span>
             </div>
             {backupNoticeOpen ? (
               <div className="backup-actions" onClick={(event) => event.stopPropagation()}>
                 <button className="ghost" onClick={() => void lib.backupNow()}>
-                  Pobierz backup (nadpisz stary)
+                  {isPl ? "Pobierz backup (nadpisz stary)" : "Download backup (overwrite old)"}
                 </button>
                 <button className="ghost" onClick={lib.dismissBackupNotice}>
-                  Ukryj
+                  {isPl ? "Ukryj" : "Hide"}
                 </button>
               </div>
             ) : null}
@@ -1447,13 +1593,27 @@ function App() {
 
         {lib.error ? <div className="error-banner" onClick={lib.clearError}>{lib.error}</div> : null}
 
-        {route.page === "dashboard" ? <DashboardPage db={lib.db} navigate={navigate} /> : null}
+        {route.page === "dashboard" ? <DashboardPage db={lib.db} navigate={navigate} language={language} /> : null}
         {route.page === "prompts" ? (
-          <PromptsPage lib={lib} params={route.params} clearParams={() => navigate("prompts")} navigate={navigate} />
+          <PromptsPage
+            lib={lib}
+            params={route.params}
+            clearParams={() => navigate("prompts")}
+            navigate={navigate}
+            language={language}
+          />
         ) : null}
-        {route.page === "create" ? <CreatePromptPage lib={lib} params={route.params} navigate={navigate} /> : null}
-        {route.page === "categories" ? <CategoriesPage lib={lib} /> : null}
-        {route.page === "data" ? <DataPage lib={lib} /> : null}
+        {route.page === "create" ? <CreatePromptPage lib={lib} params={route.params} navigate={navigate} language={language} /> : null}
+        {route.page === "categories" ? <CategoriesPage lib={lib} language={language} /> : null}
+        {route.page === "data" ? <DataPage lib={lib} language={language} /> : null}
+        {route.page === "settings" ? (
+          <SettingsPage
+            language={language}
+            onLanguageChange={setLanguage}
+            quickSaveEnabled={quickSaveEnabled}
+            onQuickSaveToggle={updateQuickSaveEnabled}
+          />
+        ) : null}
       </section>
 
       {lib.toast ? <div className="toast">{lib.toast}</div> : null}
