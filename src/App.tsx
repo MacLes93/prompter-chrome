@@ -60,6 +60,7 @@ type LibraryApi = {
   clearError: () => void;
   createPrompt: () => PromptDraft;
   upsertPrompt: (draft: PromptDraft) => string;
+  togglePromptFavorite: (id: string) => void;
   deletePrompt: (id: string) => void;
   duplicatePrompt: (id: string) => string;
   copyPrompt: (id: string) => Promise<void>;
@@ -801,6 +802,22 @@ function useLibrary(language: Language): LibraryApi {
 
       return promptId;
     },
+    togglePromptFavorite: (id) => {
+      withValidation(() => {
+        commit((prev) => {
+          const existing = prev.prompts.find((p) => p.id === id);
+          if (!existing) throw new Error(txt(language, "Prompt nie istnieje", "Prompt does not exist"));
+          const now = nowIso();
+
+          return {
+            ...prev,
+            prompts: prev.prompts.map((p) =>
+              p.id === id ? { ...p, favorite: !p.favorite, updatedAt: now } : p
+            )
+          };
+        }, txt(language, "Zaktualizowano ulubione", "Favorite updated"));
+      });
+    },
     deletePrompt: (id) => {
       withValidation(() => {
         commit(
@@ -1219,7 +1236,22 @@ function PromptsPage({
           >
             <div className="row-between">
               <h3>{prompt.title}</h3>
-              {prompt.favorite ? <span>⭐</span> : null}
+              <button
+                type="button"
+                className={prompt.favorite ? "favorite-toggle active" : "favorite-toggle"}
+                aria-label={prompt.favorite
+                  ? (isPl ? "Usuń z ulubionych" : "Remove from favorites")
+                  : (isPl ? "Dodaj do ulubionych" : "Add to favorites")}
+                title={prompt.favorite
+                  ? (isPl ? "Usuń z ulubionych" : "Remove from favorites")
+                  : (isPl ? "Dodaj do ulubionych" : "Add to favorites")}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  lib.togglePromptFavorite(prompt.id);
+                }}
+              >
+                ★
+              </button>
             </div>
             <div className="tag-cloud">
               <span className="chip">
@@ -1244,7 +1276,22 @@ function PromptsPage({
         <section className="prompt-preview-backdrop" onClick={() => setSelectedPromptId(null)}>
           <article className="prompt-preview" onClick={(event) => event.stopPropagation()}>
             <div className="row-between">
-              <h2>{selectedPrompt.title}</h2>
+              <div className="prompt-preview-title">
+                <h2>{selectedPrompt.title}</h2>
+                <button
+                  type="button"
+                  className={selectedPrompt.favorite ? "favorite-toggle active" : "favorite-toggle"}
+                  aria-label={selectedPrompt.favorite
+                    ? (isPl ? "Usuń z ulubionych" : "Remove from favorites")
+                    : (isPl ? "Dodaj do ulubionych" : "Add to favorites")}
+                  title={selectedPrompt.favorite
+                    ? (isPl ? "Usuń z ulubionych" : "Remove from favorites")
+                    : (isPl ? "Dodaj do ulubionych" : "Add to favorites")}
+                  onClick={() => lib.togglePromptFavorite(selectedPrompt.id)}
+                >
+                  ★
+                </button>
+              </div>
               <button className="ghost" onClick={() => setSelectedPromptId(null)}>{isPl ? "Zamknij" : "Close"}</button>
             </div>
 

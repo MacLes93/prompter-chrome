@@ -351,6 +351,7 @@ textarea {
   padding: 0.9rem;
   background: #1a2740;
   cursor: pointer;
+  position: relative;
 }
 
 .library-card.selected {
@@ -371,6 +372,33 @@ textarea {
 
 .library-card small {
   color: #7f93bd;
+}
+
+.favorite-toggle {
+  width: 2rem;
+  min-width: 2rem;
+  height: 2rem;
+  padding: 0;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 999px;
+  border: 1px solid #41557f;
+  background: rgba(13, 23, 47, 0.9);
+  color: #8da1c9;
+  font-size: 1.05rem;
+  line-height: 1;
+}
+
+.favorite-toggle:hover {
+  color: #ffd76a;
+  border-color: #d6a93f;
+  background: rgba(52, 40, 8, 0.9);
+}
+
+.favorite-toggle.active {
+  color: #ffd76a;
+  border-color: #d6a93f;
+  background: linear-gradient(180deg, #5a4510, #342808);
 }
 
 .prompt-preview-backdrop {
@@ -397,6 +425,12 @@ textarea {
 .prompt-preview h2 {
   margin: 0;
   color: #f5f7ff;
+}
+
+.prompt-preview-title {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
 }
 
 .prompt-preview pre {
