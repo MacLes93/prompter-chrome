@@ -158,34 +158,6 @@ button.danger {
   gap: 0.5rem;
 }
 
-.backup-notice {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 0.8rem;
-  border: 1px solid #3d4f79;
-  background: #131f3d;
-  border-radius: 12px;
-  padding: 0.65rem 0.8rem;
-  cursor: pointer;
-}
-
-.backup-notice strong {
-  display: block;
-  color: #e9efff;
-}
-
-.backup-notice span {
-  color: #9eb2dd;
-  font-size: 0.9rem;
-}
-
-.backup-actions {
-  display: flex;
-  gap: 0.45rem;
-  align-items: center;
-}
-
 .surface {
   border-radius: 14px;
   border: 1px solid #26395f;
@@ -535,6 +507,12 @@ textarea {
   margin: 0.35rem 0 0;
   color: #9eb0d2;
   font-size: 0.88rem;
+}
+
+.import-path {
+  display: block;
+  margin-top: 0.2rem;
+  color: #7f93bd;
 }
 
 .import-badge {

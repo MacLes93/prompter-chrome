@@ -12,6 +12,7 @@ type Prompt = {
   categoryId: string;
   content: string;
   tags: string[];
+  sourcePath: string | null;
   favorite: boolean;
   createdAt: string;
   updatedAt: string;
@@ -43,15 +44,20 @@ type RouteState = {
   params: URLSearchParams;
 };
 
+type MdImportCandidate = {
+  sourcePath: string;
+  categoryName: string;
+  title: string;
+  content: string;
+  tags: string[];
+};
+
 type LibraryApi = {
   loading: boolean;
-  backupPending: boolean;
   db: DbFile;
   error: string | null;
   toast: string | null;
   clearError: () => void;
-  dismissBackupNotice: () => void;
-  backupNow: () => Promise<void>;
   createPrompt: () => PromptDraft;
   upsertPrompt: (draft: PromptDraft) => string;
   deletePrompt: (id: string) => void;
@@ -62,16 +68,18 @@ type LibraryApi = {
   deleteCategory: (id: string) => void;
   exportJson: () => string;
   importJson: (raw: string) => void;
+  importMarkdownPrompts: (candidates: MdImportCandidate[]) => void;
 };
 
 const UNCATEGORIZED_ID = "uncategorized";
 const STORAGE_KEY = "prompter.prompts.v1";
 const QUICK_SAVE_ENABLED_KEY = "prompter.quickSaveEnabled";
 const LANGUAGE_KEY = "prompter.language";
-const SAVE_DEBOUNCE_MS = 400;
+const LEGACY_JSON_EXPORT_ENABLED_KEY = "prompter.legacyJsonExportEnabled";
 const chromeApi = (globalThis as { chrome?: any }).chrome;
 const hasExtensionStorage = Boolean(chromeApi?.storage?.local);
 const DEFAULT_UNCATEGORIZED_LABEL = "Bez kategorii";
+const MARKDOWN_EXPORT_ROOT = "prompter";
 
 function txt(language: Language, pl: string, en: string) {
   return language === "pl" ? pl : en;
@@ -86,6 +94,218 @@ function uuid() {
     return crypto.randomUUID();
   }
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function uniqueSortedTags(tags: string[]) {
+  return Array.from(new Set(tags.map((tag) => tag.trim()).filter(Boolean))).sort((a, b) =>
+    a.localeCompare(b, "pl", { sensitivity: "base" })
+  );
+}
+
+function normalizeSourcePath(raw: string | null | undefined) {
+  if (!raw) return null;
+  const normalized = raw
+    .replace(/\\/g, "/")
+    .split("/")
+    .map((segment) => segment.trim())
+    .filter(Boolean)
+    .join("/");
+  return normalized || null;
+}
+
+function stripMarkdownExtension(fileName: string) {
+  return fileName.replace(/\.md$/i, "");
+}
+
+function sanitizePathSegment(segment: string) {
+  const sanitized = segment
+    .trim()
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "-")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  return sanitized || "untitled";
+}
+
+function titleFromMarkdownFile(sourcePath: string, content: string) {
+  const heading = content
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => /^#\s+.+/.test(line));
+  if (heading) return heading.replace(/^#\s+/, "").trim();
+
+  const fileName = sourcePath.split("/").pop() || "prompt.md";
+  return stripMarkdownExtension(fileName).replace(/[-_]+/g, " ").trim() || "Nowy prompt";
+}
+
+function tagsFromSourcePath(sourcePath: string) {
+  const normalized = normalizeSourcePath(sourcePath);
+  if (!normalized) return [];
+  const parts = normalized.split("/");
+  if (parts.length <= 2) return [];
+  return uniqueSortedTags(parts.slice(2, -1));
+}
+
+function categoryNameFromSourcePath(sourcePath: string) {
+  const normalized = normalizeSourcePath(sourcePath);
+  if (!normalized) return DEFAULT_UNCATEGORIZED_LABEL;
+  const parts = normalized.split("/");
+  if (parts.length >= 3) return parts[1];
+  return DEFAULT_UNCATEGORIZED_LABEL;
+}
+
+function markdownExportPath(prompt: Prompt, categoryName: string) {
+  const folderParts = [
+    MARKDOWN_EXPORT_ROOT,
+    sanitizePathSegment(categoryName || DEFAULT_UNCATEGORIZED_LABEL),
+    ...prompt.tags.map(sanitizePathSegment)
+  ];
+  const fileName = `${sanitizePathSegment(prompt.title)}.md`;
+  return [...folderParts, fileName].join("/");
+}
+
+function crc32(bytes: Uint8Array) {
+  let crc = 0xffffffff;
+  for (let index = 0; index < bytes.length; index += 1) {
+    crc ^= bytes[index];
+    for (let bit = 0; bit < 8; bit += 1) {
+      const mask = -(crc & 1);
+      crc = (crc >>> 1) ^ (0xedb88320 & mask);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function dateToDosParts(date: Date) {
+  const year = Math.max(1980, date.getFullYear());
+  const dosTime =
+    ((date.getHours() & 0x1f) << 11) |
+    ((date.getMinutes() & 0x3f) << 5) |
+    ((Math.floor(date.getSeconds() / 2)) & 0x1f);
+  const dosDate =
+    (((year - 1980) & 0x7f) << 9) |
+    (((date.getMonth() + 1) & 0x0f) << 5) |
+    (date.getDate() & 0x1f);
+  return { dosTime, dosDate };
+}
+
+function createStoredZip(files: Array<{ path: string; content: string }>) {
+  function toArrayBuffer(bytes: Uint8Array) {
+    const copy = new Uint8Array(bytes.byteLength);
+    copy.set(bytes);
+    return copy.buffer;
+  }
+
+  const encoder = new TextEncoder();
+  const zipDate = dateToDosParts(new Date());
+  const localParts: Uint8Array[] = [];
+  const centralParts: Uint8Array[] = [];
+  let offset = 0;
+
+  for (const file of files) {
+    const pathBytes = encoder.encode(file.path);
+    const contentBytes = encoder.encode(file.content);
+    const crc = crc32(contentBytes);
+
+    const localHeader = new Uint8Array(30 + pathBytes.length);
+    const localView = new DataView(localHeader.buffer);
+    localView.setUint32(0, 0x04034b50, true);
+    localView.setUint16(4, 20, true);
+    localView.setUint16(6, 0, true);
+    localView.setUint16(8, 0, true);
+    localView.setUint16(10, zipDate.dosTime, true);
+    localView.setUint16(12, zipDate.dosDate, true);
+    localView.setUint32(14, crc, true);
+    localView.setUint32(18, contentBytes.length, true);
+    localView.setUint32(22, contentBytes.length, true);
+    localView.setUint16(26, pathBytes.length, true);
+    localView.setUint16(28, 0, true);
+    localHeader.set(pathBytes, 30);
+    localParts.push(localHeader, contentBytes);
+
+    const centralHeader = new Uint8Array(46 + pathBytes.length);
+    const centralView = new DataView(centralHeader.buffer);
+    centralView.setUint32(0, 0x02014b50, true);
+    centralView.setUint16(4, 20, true);
+    centralView.setUint16(6, 20, true);
+    centralView.setUint16(8, 0, true);
+    centralView.setUint16(10, 0, true);
+    centralView.setUint16(12, zipDate.dosTime, true);
+    centralView.setUint16(14, zipDate.dosDate, true);
+    centralView.setUint32(16, crc, true);
+    centralView.setUint32(20, contentBytes.length, true);
+    centralView.setUint32(24, contentBytes.length, true);
+    centralView.setUint16(28, pathBytes.length, true);
+    centralView.setUint16(30, 0, true);
+    centralView.setUint16(32, 0, true);
+    centralView.setUint16(34, 0, true);
+    centralView.setUint16(36, 0, true);
+    centralView.setUint32(38, 0, true);
+    centralView.setUint32(42, offset, true);
+    centralHeader.set(pathBytes, 46);
+    centralParts.push(centralHeader);
+
+    offset += localHeader.length + contentBytes.length;
+  }
+
+  const centralDirectorySize = centralParts.reduce((sum, part) => sum + part.length, 0);
+  const endRecord = new Uint8Array(22);
+  const endView = new DataView(endRecord.buffer);
+  endView.setUint32(0, 0x06054b50, true);
+  endView.setUint16(4, 0, true);
+  endView.setUint16(6, 0, true);
+  endView.setUint16(8, files.length, true);
+  endView.setUint16(10, files.length, true);
+  endView.setUint32(12, centralDirectorySize, true);
+  endView.setUint32(16, offset, true);
+  endView.setUint16(20, 0, true);
+
+  return new Blob(
+    [...localParts, ...centralParts, endRecord].map((part) => toArrayBuffer(part)),
+    { type: "application/zip" }
+  );
+}
+
+async function markdownCandidateFromFile(file: File) {
+  const pathSource = "webkitRelativePath" in file && typeof file.webkitRelativePath === "string"
+    ? file.webkitRelativePath
+    : file.name;
+  const sourcePath = normalizeSourcePath(pathSource);
+  if (!sourcePath) return null;
+
+  const content = (await file.text()).trim();
+  if (!content) return null;
+
+  return {
+    sourcePath,
+    categoryName: categoryNameFromSourcePath(sourcePath),
+    title: titleFromMarkdownFile(sourcePath, content),
+    content,
+    tags: tagsFromSourcePath(sourcePath)
+  } satisfies MdImportCandidate;
+}
+
+async function writePromptMarkdownToDirectory(
+  rootHandle: any,
+  prompt: Prompt,
+  categoryName: string
+) {
+  const relativePath = markdownExportPath(prompt, categoryName);
+  const parts = relativePath.split("/").filter(Boolean);
+  if (parts.length === 0) return;
+
+  let currentHandle = rootHandle;
+  for (const segment of parts.slice(0, -1)) {
+    currentHandle = await currentHandle.getDirectoryHandle(sanitizePathSegment(segment), { create: true });
+  }
+
+  const fileName = parts[parts.length - 1];
+  const fileHandle = await currentHandle.getFileHandle(fileName.toLowerCase().endsWith(".md") ? fileName : `${fileName}.md`, {
+    create: true
+  });
+  const writable = await fileHandle.createWritable();
+  await writable.write(prompt.content);
+  await writable.close();
 }
 
 function createDraft(): PromptDraft {
@@ -146,6 +366,7 @@ function normalizeDb(input: DbFile): DbFile {
       categoryId: categoryMap.has(p.categoryId) ? p.categoryId : UNCATEGORIZED_ID,
       content: p.content?.trim() || "",
       tags,
+      sourcePath: normalizeSourcePath(p.sourcePath),
       favorite: !!p.favorite,
       createdAt: p.createdAt || nowIso(),
       updatedAt: p.updatedAt || p.createdAt || nowIso(),
@@ -197,9 +418,8 @@ function mergeImported(current: DbFile, imported: DbFile): DbFile {
       ...importedPrompt,
       id: importedPrompt.id || uuid(),
       categoryId: categoryIdMap.get(importedPrompt.categoryId) ?? UNCATEGORIZED_ID,
-      tags: Array.from(
-        new Set((importedPrompt.tags ?? []).map((tag) => tag.trim()).filter(Boolean))
-      ).sort((a, b) => a.localeCompare(b, "pl", { sensitivity: "base" }))
+      tags: uniqueSortedTags(importedPrompt.tags ?? []),
+      sourcePath: normalizeSourcePath(importedPrompt.sourcePath)
     };
 
     promptById.set(normalized.id, normalized);
@@ -367,9 +587,44 @@ function useQuickSaveSetting() {
   return { quickSaveEnabled, updateQuickSaveEnabled };
 }
 
+function useLegacyJsonExportSetting() {
+  const [legacyJsonExportEnabled, setLegacyJsonExportEnabled] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+
+    void (async () => {
+      if (hasExtensionStorage) {
+        const result = await chromeApi.storage.local.get([LEGACY_JSON_EXPORT_ENABLED_KEY]);
+        if (!active) return;
+        setLegacyJsonExportEnabled(Boolean(result?.[LEGACY_JSON_EXPORT_ENABLED_KEY]));
+        return;
+      }
+
+      const raw = localStorage.getItem(LEGACY_JSON_EXPORT_ENABLED_KEY);
+      if (!active) return;
+      setLegacyJsonExportEnabled(raw === "true");
+    })();
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  async function updateLegacyJsonExportEnabled(next: boolean) {
+    setLegacyJsonExportEnabled(next);
+    if (hasExtensionStorage) {
+      await chromeApi.storage.local.set({ [LEGACY_JSON_EXPORT_ENABLED_KEY]: next });
+      return;
+    }
+    localStorage.setItem(LEGACY_JSON_EXPORT_ENABLED_KEY, String(next));
+  }
+
+  return { legacyJsonExportEnabled, updateLegacyJsonExportEnabled };
+}
+
 function useLibrary(language: Language): LibraryApi {
   const [loading, setLoading] = useState(true);
-  const [backupPending, setBackupPending] = useState(false);
   const [db, setDb] = useState<DbFile>(() => defaultDb());
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
@@ -390,15 +645,6 @@ function useLibrary(language: Language): LibraryApi {
   }, []);
 
   useEffect(() => {
-    if (loading) return;
-    const timer = window.setTimeout(() => {
-      void writeStoredDbRaw(JSON.stringify(db));
-    }, SAVE_DEBOUNCE_MS);
-
-    return () => window.clearTimeout(timer);
-  }, [db, loading]);
-
-  useEffect(() => {
     if (!toast) return;
     const timer = window.setTimeout(() => setToast(null), 1800);
     return () => window.clearTimeout(timer);
@@ -406,8 +652,11 @@ function useLibrary(language: Language): LibraryApi {
 
   function commit(mutator: (prev: DbFile) => DbFile, toastMessage?: string) {
     setError(null);
-    setDb((prev) => normalizeDb(mutator(prev)));
-    setBackupPending(true);
+    setDb((prev) => {
+      const next = normalizeDb(mutator(prev));
+      void writeStoredDbRaw(JSON.stringify(next));
+      return next;
+    });
     if (toastMessage) setToast(toastMessage);
   }
 
@@ -420,38 +669,78 @@ function useLibrary(language: Language): LibraryApi {
     }
   }
 
+  function mergeMarkdownCandidates(current: DbFile, candidates: MdImportCandidate[]): DbFile {
+    const categories = [...current.categories];
+    const categoryIdByName = new Map(
+      categories.map((category) => [category.name.trim().toLowerCase(), category.id] as const)
+    );
+    const prompts = [...current.prompts];
+    const now = nowIso();
+    const promptIndexBySourcePath = new Map<string, number>();
+
+    for (let index = 0; index < prompts.length; index += 1) {
+      const sourcePath = normalizeSourcePath(prompts[index].sourcePath);
+      if (sourcePath) promptIndexBySourcePath.set(sourcePath, index);
+    }
+
+    for (const candidate of candidates) {
+      const sourcePath = normalizeSourcePath(candidate.sourcePath);
+      if (!sourcePath) continue;
+
+      const categoryName = candidate.categoryName.trim() || DEFAULT_UNCATEGORIZED_LABEL;
+      const categoryLookupKey = categoryName.toLowerCase();
+      let categoryId = categoryIdByName.get(categoryLookupKey) ?? null;
+      if (!categoryId) {
+        categoryId = uuid();
+        categories.push({ id: categoryId, name: categoryName, createdAt: now });
+        categoryIdByName.set(categoryLookupKey, categoryId);
+      }
+
+      const tags = uniqueSortedTags(candidate.tags);
+      const existingIndex = promptIndexBySourcePath.get(sourcePath);
+
+      if (existingIndex !== undefined) {
+        const existing = prompts[existingIndex];
+        prompts[existingIndex] = {
+          ...existing,
+          title: candidate.title.trim() || existing.title,
+          categoryId,
+          content: candidate.content.trim(),
+          tags,
+          sourcePath,
+          updatedAt: now
+        };
+        continue;
+      }
+
+      prompts.push({
+        id: uuid(),
+        title: candidate.title.trim() || "Nowy prompt",
+        categoryId,
+        content: candidate.content.trim(),
+        tags,
+        sourcePath,
+        favorite: false,
+        createdAt: now,
+        updatedAt: now,
+        lastUsedAt: null
+      });
+      promptIndexBySourcePath.set(sourcePath, prompts.length - 1);
+    }
+
+    return {
+      ...current,
+      categories,
+      prompts
+    };
+  }
+
   return {
     loading,
-    backupPending,
     db,
     error,
     toast,
     clearError: () => setError(null),
-    dismissBackupNotice: () => setBackupPending(false),
-    backupNow: async () => {
-      const json = JSON.stringify(db, null, 2);
-
-      if (hasExtensionStorage) {
-        try {
-          chromeApi.runtime?.sendMessage({ type: "BACKUP_NOW", json });
-          setBackupPending(false);
-          setToast(txt(language, "Backup zapisany do Downloads", "Backup saved to Downloads"));
-        } catch {
-          setError(txt(language, "Nie udało się utworzyć backupu pliku", "Could not create backup file"));
-        }
-        return;
-      }
-
-      const blob = new Blob([json], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = "prompts-latest.json";
-      link.click();
-      URL.revokeObjectURL(url);
-      setBackupPending(false);
-      setToast(txt(language, "Backup pobrany", "Backup downloaded"));
-    },
     createPrompt: createDraft,
     upsertPrompt: (draft) => {
       if (!draft.title.trim()) throw new Error(txt(language, "Pole title jest wymagane", "Title is required"));
@@ -499,6 +788,7 @@ function useLibrary(language: Language): LibraryApi {
                 categoryId,
                 content: draft.content.trim(),
                 tags,
+                sourcePath: null,
                 favorite: draft.favorite,
                 createdAt: now,
                 updatedAt: now,
@@ -538,6 +828,7 @@ function useLibrary(language: Language): LibraryApi {
                 ...original,
                 id: copyId,
                 title: `${original.title} ${txt(language, "(kopia)", "(copy)")}`,
+                sourcePath: null,
                 createdAt: now,
                 updatedAt: now,
                 lastUsedAt: null
@@ -643,6 +934,17 @@ function useLibrary(language: Language): LibraryApi {
         const parsed = JSON.parse(raw) as DbFile;
         const normalizedImported = normalizeDb(parsed);
         commit((prev) => mergeImported(prev, normalizedImported), txt(language, "Zaimportowano dane", "Imported data"));
+      });
+    },
+    importMarkdownPrompts: (candidates) => {
+      withValidation(() => {
+        if (candidates.length === 0) {
+          throw new Error(txt(language, "Nie znaleziono plików Markdown", "No Markdown files found"));
+        }
+        commit(
+          (prev) => mergeMarkdownCandidates(prev, candidates),
+          txt(language, "Zaimportowano pliki Markdown", "Imported Markdown files")
+        );
       });
     }
   };
@@ -798,29 +1100,6 @@ function PromptsPage({
     }
   }, [prompts, selectedPromptId]);
 
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      const cmd = event.metaKey || event.ctrlKey;
-      if (!cmd) return;
-
-      if (event.key.toLowerCase() === "k") {
-        event.preventDefault();
-        searchRef.current?.focus();
-      }
-      if (event.key.toLowerCase() === "n") {
-        event.preventDefault();
-        navigate("create");
-      }
-      if (event.key === "Enter" && selectedPromptId) {
-        event.preventDefault();
-        void lib.copyPrompt(selectedPromptId);
-      }
-    };
-
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [lib, navigate, selectedPromptId]);
-
   const tagsUniverse = useMemo(() => {
     const unique = new Set<string>();
     for (const prompt of prompts) {
@@ -905,7 +1184,7 @@ function PromptsPage({
           className="library-search"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
-          placeholder={isPl ? "Szukaj promptów... (Ctrl/Cmd+K)" : "Search prompts... (Ctrl/Cmd+K)"}
+          placeholder={isPl ? "Szukaj promptów..." : "Search prompts..."}
         />
         <input
           className="tag-search"
@@ -1239,13 +1518,27 @@ function CategoriesPage({ lib, language }: { lib: LibraryApi; language: Language
   );
 }
 
-function DataPage({ lib, language }: { lib: LibraryApi; language: Language }) {
+function DataPage({
+  lib,
+  language,
+  legacyJsonExportEnabled
+}: {
+  lib: LibraryApi;
+  language: Language;
+  legacyJsonExportEnabled: boolean;
+}) {
   const isPl = language === "pl";
   const fileRef = useRef<HTMLInputElement>(null);
+  const markdownFolderRef = useRef<HTMLInputElement>(null);
   const [importPreview, setImportPreview] = useState<DbFile | null>(null);
   const [selectedImportIds, setSelectedImportIds] = useState<string[]>([]);
   const [importFileName, setImportFileName] = useState("");
   const [importError, setImportError] = useState<string | null>(null);
+  const [markdownImportPreview, setMarkdownImportPreview] = useState<MdImportCandidate[] | null>(null);
+  const [selectedMarkdownPaths, setSelectedMarkdownPaths] = useState<string[]>([]);
+  const [markdownImportName, setMarkdownImportName] = useState("");
+  const [markdownImportError, setMarkdownImportError] = useState<string | null>(null);
+  const [markdownExportBusy, setMarkdownExportBusy] = useState(false);
 
   function downloadExport() {
     const blob = new Blob([lib.exportJson()], { type: "application/json" });
@@ -1284,6 +1577,44 @@ function DataPage({ lib, language }: { lib: LibraryApi; language: Language }) {
     event.target.value = "";
   }
 
+  async function onMarkdownFolderImport(event: ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.target.files ?? []);
+    setMarkdownImportError(null);
+
+    try {
+      const markdownFiles = files.filter((file) => /\.md$/i.test(file.name));
+      const candidatesRaw = await Promise.all(markdownFiles.map((file) => markdownCandidateFromFile(file)));
+      const candidates = candidatesRaw.filter((candidate): candidate is MdImportCandidate => candidate !== null);
+
+      if (candidates.length === 0) {
+        setMarkdownImportError(isPl ? "Nie znaleziono plików Markdown w wybranym katalogu" : "No Markdown files found in the selected folder");
+        setMarkdownImportPreview(null);
+        setSelectedMarkdownPaths([]);
+        setMarkdownImportName("");
+        return;
+      }
+
+      const directoryName = files[0] && "webkitRelativePath" in files[0] && typeof files[0].webkitRelativePath === "string"
+        ? files[0].webkitRelativePath.split("/")[0] || files[0].name
+        : files[0]?.name || "";
+
+      const uniqueCandidates = Array.from(
+        new Map(candidates.map((candidate) => [candidate.sourcePath, candidate])).values()
+      ).sort((a, b) => a.sourcePath.localeCompare(b.sourcePath, "pl", { sensitivity: "base" }));
+
+      setMarkdownImportName(directoryName);
+      setMarkdownImportPreview(uniqueCandidates);
+      setSelectedMarkdownPaths(uniqueCandidates.map((candidate) => candidate.sourcePath));
+    } catch {
+      setMarkdownImportError(isPl ? "Nie udało się wczytać katalogu Markdown" : "Could not read the Markdown folder");
+      setMarkdownImportPreview(null);
+      setSelectedMarkdownPaths([]);
+      setMarkdownImportName("");
+    }
+
+    event.target.value = "";
+  }
+
   function applySelectedImport() {
     if (!importPreview) return;
     const selectedPrompts = importPreview.prompts.filter((prompt) =>
@@ -1315,13 +1646,72 @@ function DataPage({ lib, language }: { lib: LibraryApi; language: Language }) {
     setImportError(null);
   }
 
+  function applySelectedMarkdownImport() {
+    if (!markdownImportPreview) return;
+
+    const selectedCandidates = markdownImportPreview.filter((candidate) =>
+      selectedMarkdownPaths.includes(candidate.sourcePath)
+    );
+    if (selectedCandidates.length === 0) {
+      setMarkdownImportError(isPl ? "Wybierz co najmniej jeden plik Markdown" : "Select at least one Markdown file");
+      return;
+    }
+
+    lib.importMarkdownPrompts(selectedCandidates);
+    setMarkdownImportPreview(null);
+    setSelectedMarkdownPaths([]);
+    setMarkdownImportName("");
+    setMarkdownImportError(null);
+  }
+
+  async function exportPromptsZip() {
+    setMarkdownImportError(null);
+    setMarkdownExportBusy(true);
+    try {
+      const categoryNameById = new Map(
+        lib.db.categories.map((category) => [category.id, category.name] as const)
+      );
+      const files = lib.db.prompts.map((prompt) => ({
+        path: markdownExportPath(
+          prompt,
+          categoryNameById.get(prompt.categoryId) ?? DEFAULT_UNCATEGORIZED_LABEL
+        ),
+        content: prompt.content
+      }));
+      const zipBlob = createStoredZip(files);
+      const url = URL.createObjectURL(zipBlob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `prompts-export-${new Date().toISOString().slice(0, 10)}.zip`;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      setMarkdownImportError(
+        isPl ? "Nie udało się wyeksportować promptów" : "Could not export prompts"
+      );
+    } finally {
+      setMarkdownExportBusy(false);
+    }
+  }
+
   const existingIds = useMemo(
     () => new Set(lib.db.prompts.map((prompt) => prompt.id)),
+    [lib.db.prompts]
+  );
+  const existingSourcePaths = useMemo(
+    () =>
+      new Set(
+        lib.db.prompts
+          .map((prompt) => normalizeSourcePath(prompt.sourcePath))
+          .filter((path): path is string => Boolean(path))
+      ),
     [lib.db.prompts]
   );
 
   const selectedCount = selectedImportIds.length;
   const previewCount = importPreview?.prompts.length ?? 0;
+  const selectedMarkdownCount = selectedMarkdownPaths.length;
+  const markdownPreviewCount = markdownImportPreview?.length ?? 0;
 
   return (
     <div className="data-layout">
@@ -1329,15 +1719,37 @@ function DataPage({ lib, language }: { lib: LibraryApi; language: Language }) {
         <h2>{isPl ? "Import / Eksport" : "Import / Export"}</h2>
         <p>
           {isPl
-            ? "Export zapisuje pełny JSON biblioteki. Import scala dane: aktualizuje prompty o tym samym `id`, tworzy brakujące i dopasowuje kategorie po `id` i nazwie."
-            : "Export saves the full library JSON. Import merges data: updates prompts with the same `id`, creates missing ones, and matches categories by `id` and name."}
+            ? "Open prompts folder importuje pliki Markdown z całego katalogu. Katalog główny jest ignorowany, pierwszy folder pod nim staje się kategorią, a kolejne foldery stają się tagami. Export prompts zapisuje całą bibliotekę do jednego pliku ZIP z tą samą strukturą."
+            : "Open prompts folder imports Markdown files from a whole directory. The root folder is ignored, the first nested folder becomes the category, and the following folders become tags. Export prompts writes the whole library to a single ZIP file using the same structure."}
         </p>
         <div className="row-gap">
-          <button onClick={downloadExport}>{isPl ? "Eksport JSON" : "Export JSON"}</button>
-          <button className="ghost" onClick={() => fileRef.current?.click()}>{isPl ? "Import JSON" : "Import JSON"}</button>
+          {legacyJsonExportEnabled ? (
+            <button onClick={downloadExport}>{isPl ? "Eksport JSON (legacy)" : "Export JSON (legacy)"}</button>
+          ) : null}
+          {legacyJsonExportEnabled ? (
+            <button className="ghost" onClick={() => fileRef.current?.click()}>{isPl ? "Import JSON (legacy)" : "Import JSON (legacy)"}</button>
+          ) : null}
+          <button className="ghost" onClick={() => markdownFolderRef.current?.click()}>
+            {isPl ? "Open prompts folder" : "Open prompts folder"}
+          </button>
+          <button className="ghost" onClick={() => void exportPromptsZip()} disabled={markdownExportBusy}>
+            {markdownExportBusy
+              ? (isPl ? "Eksport promptów..." : "Exporting prompts...")
+              : "Export prompts"}
+          </button>
           <input ref={fileRef} type="file" accept="application/json,.json" onChange={onFileImport} hidden />
+          <input
+            ref={markdownFolderRef}
+            type="file"
+            accept=".md,text/markdown"
+            multiple
+            onChange={onMarkdownFolderImport}
+            {...({ webkitdirectory: "", directory: "" } as Record<string, string>)}
+            hidden
+          />
         </div>
         {importError ? <p className="import-error">{importError}</p> : null}
+        {markdownImportError ? <p className="import-error">{markdownImportError}</p> : null}
       </section>
 
       {importPreview ? (
@@ -1404,12 +1816,92 @@ function DataPage({ lib, language }: { lib: LibraryApi; language: Language }) {
         </section>
       ) : null}
 
+      {markdownImportPreview ? (
+        <section className="surface import-preview">
+          <div className="section-title-row">
+            <h2>{isPl ? "Podgląd importu Markdown" : "Markdown import preview"}: {markdownImportName}</h2>
+            <small>{selectedMarkdownCount} / {markdownPreviewCount} {isPl ? "zaznaczone" : "selected"}</small>
+          </div>
+          <div className="row-gap">
+            <button
+              className="ghost"
+              onClick={() => setSelectedMarkdownPaths(markdownImportPreview.map((candidate) => candidate.sourcePath))}
+            >
+              {isPl ? "Zaznacz wszystko" : "Select all"}
+            </button>
+            <button
+              className="ghost"
+              onClick={() =>
+                setSelectedMarkdownPaths(
+                  markdownImportPreview
+                    .filter((candidate) => !existingSourcePaths.has(candidate.sourcePath))
+                    .map((candidate) => candidate.sourcePath)
+                )
+              }
+            >
+              {isPl ? "Tylko nowe ścieżki" : "Only new paths"}
+            </button>
+            <button className="ghost" onClick={() => setSelectedMarkdownPaths([])}>
+              {isPl ? "Wyczyść" : "Clear"}
+            </button>
+            <button onClick={applySelectedMarkdownImport}>
+              {isPl ? "Importuj pliki Markdown" : "Import Markdown files"}
+            </button>
+          </div>
+
+          <div className="import-list">
+            {markdownImportPreview.map((candidate) => {
+              const isUpdate = existingSourcePaths.has(candidate.sourcePath);
+              const checked = selectedMarkdownPaths.includes(candidate.sourcePath);
+              return (
+                <label key={candidate.sourcePath} className={checked ? "import-item selected" : "import-item"}>
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={(event) => {
+                      if (event.target.checked) {
+                        setSelectedMarkdownPaths((prev) => [...prev, candidate.sourcePath]);
+                      } else {
+                        setSelectedMarkdownPaths((prev) => prev.filter((path) => path !== candidate.sourcePath));
+                      }
+                    }}
+                  />
+                  <div>
+                    <div className="row-between">
+                      <strong>{candidate.title}</strong>
+                      <span className={isUpdate ? "import-badge update" : "import-badge new"}>
+                        {isUpdate ? (isPl ? "aktualizacja" : "update") : (isPl ? "nowy" : "new")}
+                      </span>
+                    </div>
+                    <small className="import-path">
+                      {isPl ? "Kategoria" : "Category"}: {candidate.categoryName}
+                    </small>
+                    <small className="import-path">{candidate.sourcePath}</small>
+                    <p>{candidate.content.slice(0, 120)}{candidate.content.length > 120 ? "..." : ""}</p>
+                    <div className="tag-cloud">
+                      {candidate.tags.length === 0 ? (
+                        <span className="chip">{isPl ? "Brak tagów z folderów" : "No folder tags"}</span>
+                      ) : (
+                        candidate.tags.map((tag) => (
+                          <span key={`${candidate.sourcePath}-${tag}`} className="chip chip-purple">{tag}</span>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                </label>
+              );
+            })}
+          </div>
+        </section>
+      ) : null}
+
       <section className="surface">
         <h2>{isPl ? "Jak działa import" : "How import works"}</h2>
         <ul className="stats-list">
-          <li>{isPl ? "wybierasz plik," : "choose a file,"}</li>
-          <li>{isPl ? "zaznaczasz prompty do dociągnięcia," : "select prompts to import,"}</li>
-          <li>{isPl ? "importuje tylko zaznaczone rekordy." : "only selected records are imported."}</li>
+          <li>{isPl ? "otwierasz katalog z promptami," : "open a prompts folder,"}</li>
+          <li>{isPl ? "sprawdzasz podgląd i zaznaczasz rekordy do importu," : "review the preview and select records to import,"}</li>
+          <li>{isPl ? "przy imporcie Markdown katalog główny jest ignorowany, pierwszy pod nim tworzy kategorię, kolejne tworzą tagi," : "during Markdown import the root folder is ignored, the first nested folder becomes the category, and the following folders become tags,"}</li>
+          <li>{isPl ? "eksport promptów tworzy jeden plik ZIP z odtworzoną strukturą katalogów." : "prompt export creates a single ZIP file with the reconstructed folder structure."}</li>
         </ul>
       </section>
 
@@ -1423,14 +1915,6 @@ function DataPage({ lib, language }: { lib: LibraryApi; language: Language }) {
         </ul>
       </section>
 
-      <section className="surface">
-        <h2>{isPl ? "Skróty klawiszowe" : "Keyboard shortcuts"}</h2>
-        <ul className="stats-list">
-          <li>{isPl ? "Ctrl/Cmd + K: fokus na wyszukiwarce (na stronie promptów)" : "Ctrl/Cmd + K: focus search (on prompts page)"}</li>
-          <li>{isPl ? "Ctrl/Cmd + N: nowy prompt (na stronie promptów)" : "Ctrl/Cmd + N: new prompt (on prompts page)"}</li>
-          <li>{isPl ? "Ctrl/Cmd + Enter: kopiuj aktualny prompt (na stronie promptów)" : "Ctrl/Cmd + Enter: copy current prompt (on prompts page)"}</li>
-        </ul>
-      </section>
     </div>
   );
 }
@@ -1439,12 +1923,16 @@ function SettingsPage({
   language,
   onLanguageChange,
   quickSaveEnabled,
-  onQuickSaveToggle
+  onQuickSaveToggle,
+  legacyJsonExportEnabled,
+  onLegacyJsonExportToggle
 }: {
   language: Language;
   onLanguageChange: (next: Language) => void;
   quickSaveEnabled: boolean;
   onQuickSaveToggle: (next: boolean) => Promise<void>;
+  legacyJsonExportEnabled: boolean;
+  onLegacyJsonExportToggle: (next: boolean) => Promise<void>;
 }) {
   const isPl = language === "pl";
 
@@ -1479,6 +1967,20 @@ function SettingsPage({
             : "Show the `Save to Prompter` button on ChatGPT and Claude"}
         </label>
       </section>
+
+      <section className="surface">
+        <h2>{isPl ? "Funkcje legacy" : "Legacy features"}</h2>
+        <label className="checkbox-row">
+          <input
+            type="checkbox"
+            checked={legacyJsonExportEnabled}
+            onChange={(event) => void onLegacyJsonExportToggle(event.target.checked)}
+          />
+          {isPl
+            ? "Pokaż eksport JSON (legacy) w sekcji Dane"
+            : "Show JSON export (legacy) in the Data section"}
+        </label>
+      </section>
     </div>
   );
 }
@@ -1486,16 +1988,10 @@ function SettingsPage({
 function App() {
   const [language, setLanguage] = useLanguage();
   const { quickSaveEnabled, updateQuickSaveEnabled } = useQuickSaveSetting();
+  const { legacyJsonExportEnabled, updateLegacyJsonExportEnabled } = useLegacyJsonExportSetting();
   const lib = useLibrary(language);
   const { route, navigate } = useRouteState();
-  const [backupNoticeOpen, setBackupNoticeOpen] = useState(false);
   const isPl = language === "pl";
-
-  useEffect(() => {
-    if (!lib.backupPending) {
-      setBackupNoticeOpen(false);
-    }
-  }, [lib.backupPending]);
 
   if (lib.loading) {
     return (
@@ -1568,29 +2064,6 @@ function App() {
           </div>
         </header>
 
-        {lib.backupPending ? (
-          <div className="backup-notice" onClick={() => setBackupNoticeOpen((prev) => !prev)}>
-            <div>
-              <strong>
-                {isPl ? "Masz niezbackupowane zmiany." : "You have unbacked-up changes."}
-              </strong>
-              <span>
-                {isPl ? "Kliknij, aby zapisać plik backupu JSON." : "Click to save a JSON backup file."}
-              </span>
-            </div>
-            {backupNoticeOpen ? (
-              <div className="backup-actions" onClick={(event) => event.stopPropagation()}>
-                <button className="ghost" onClick={() => void lib.backupNow()}>
-                  {isPl ? "Pobierz backup (nadpisz stary)" : "Download backup (overwrite old)"}
-                </button>
-                <button className="ghost" onClick={lib.dismissBackupNotice}>
-                  {isPl ? "Ukryj" : "Hide"}
-                </button>
-              </div>
-            ) : null}
-          </div>
-        ) : null}
-
         {lib.error ? <div className="error-banner" onClick={lib.clearError}>{lib.error}</div> : null}
 
         {route.page === "dashboard" ? <DashboardPage db={lib.db} navigate={navigate} language={language} /> : null}
@@ -1605,13 +2078,15 @@ function App() {
         ) : null}
         {route.page === "create" ? <CreatePromptPage lib={lib} params={route.params} navigate={navigate} language={language} /> : null}
         {route.page === "categories" ? <CategoriesPage lib={lib} language={language} /> : null}
-        {route.page === "data" ? <DataPage lib={lib} language={language} /> : null}
+        {route.page === "data" ? <DataPage lib={lib} language={language} legacyJsonExportEnabled={legacyJsonExportEnabled} /> : null}
         {route.page === "settings" ? (
           <SettingsPage
             language={language}
             onLanguageChange={setLanguage}
             quickSaveEnabled={quickSaveEnabled}
             onQuickSaveToggle={updateQuickSaveEnabled}
+            legacyJsonExportEnabled={legacyJsonExportEnabled}
+            onLegacyJsonExportToggle={updateLegacyJsonExportEnabled}
           />
         ) : null}
       </section>

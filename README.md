@@ -5,15 +5,32 @@ Offline Chrome extension for managing prompt templates.
 ## Features
 
 - Prompt library with categories, tags, favorites, and quick filtering.
-- JSON import/export and backup flow.
+- Markdown folder import with automatic category/tag mapping.
+- ZIP export for prompts.
+- Optional legacy JSON import/export, hidden by default and available from `Settings`.
 - Quick-save widget on `chatgpt.com` and `claude.ai`.
 - UI language switch: English and Polish (`Settings -> Language`).
 
 ## Data Storage
 
 - Main data: `chrome.storage.local` (persistent across browser restarts/crashes).
-- Backup file: `Downloads/prompter_chrome/prompts-latest.json`.
-- Unsaved backup changes show a non-blocking notice in the app header.
+
+## Prompt Folder Import
+
+- Use `Open prompts folder` in the `Data` section to import a whole Markdown directory.
+- The root folder is ignored.
+- The first folder under the root becomes the prompt category.
+- Any following folders become tags.
+- Example:
+  `prompter/jira/api/create-plan.md`
+  becomes category `jira` and tag `api`.
+
+## Prompt Export
+
+- Use `Export prompts` in the `Data` section to download the current library as a single ZIP file.
+- Exported files are written as Markdown and grouped using this structure:
+  `prompter/<category>/<tag...>/<prompt-title>.md`
+- Legacy JSON import/export can be enabled from `Settings`.
 
 ## Quick Save (ChatGPT + Claude)
 
@@ -49,11 +66,11 @@ After code changes:
 - `#prompts` - prompt library and full preview modal.
 - `#create` - create/edit prompt view.
 - `#categories` - category management.
-- `#data` - import/export and data summary.
+- `#data` - prompt import/export and data summary.
 - `#settings` - language and site integration settings.
 
 ## Required Permissions
 
 - `storage` - save app data and settings.
-- `downloads` - write JSON backups.
+- `downloads` - download exported prompt archives and optional legacy JSON exports.
 - Host permissions for `https://chatgpt.com/*` and `https://claude.ai/*` - quick-save widget injection.
