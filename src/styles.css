@@ -239,6 +239,10 @@ button.danger {
   gap: 0.45rem;
 }
 
+.surface > .row-gap {
+  margin-bottom: 0.7rem;
+}
+
 .tag-cloud {
   display: flex;
   flex-wrap: wrap;
@@ -263,6 +267,12 @@ button.danger {
 .chip-purple {
   border-color: #7041e6;
   background: #4b2ca1;
+}
+
+.chip-warning {
+  border-color: #a87c1d;
+  background: #4a3610;
+  color: #ffe4a3;
 }
 
 .library-page {
@@ -292,7 +302,7 @@ button.danger {
 
 .library-controls {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 0.6rem;
 }
 
@@ -352,6 +362,12 @@ textarea {
   background: #1a2740;
   cursor: pointer;
   position: relative;
+}
+
+.library-card-status {
+  position: absolute;
+  top: 0.75rem;
+  right: 3.35rem;
 }
 
 .library-card.selected {
@@ -601,7 +617,7 @@ textarea {
 
 .data-layout {
   display: grid;
-  grid-template-columns: 1.4fr 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.75rem;
 }
 

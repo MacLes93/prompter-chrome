@@ -28,6 +28,7 @@ type DbFile = {
 type SortMode = "newest" | "lastUsed" | "az";
 type CategorySortMode = "az" | "countDesc" | "countAsc" | "newest";
 type CategoryBulkAction = "move" | "merge" | "delete";
+type PromptSyncStatus = "local_only" | "synced" | "missing_file" | "conflict";
 
 type PromptDraft = {
   id?: string;
@@ -54,9 +55,27 @@ type MdImportCandidate = {
   tags: string[];
 };
 
+type FolderSyncRecord = {
+  sourcePath: string;
+  lastSyncedHash: string;
+  lastSyncedAt: string;
+  missing: boolean;
+  conflict: boolean;
+  fileHash: string | null;
+};
+
+type FolderSyncState = {
+  connected: boolean;
+  folderName: string | null;
+  lastScannedAt: string | null;
+  records: Record<string, FolderSyncRecord>;
+};
+
 type LibraryApi = {
   loading: boolean;
   db: DbFile;
+  sync: FolderSyncState;
+  syncBusy: boolean;
   error: string | null;
   toast: string | null;
   clearError: () => void;
@@ -75,13 +94,24 @@ type LibraryApi = {
   exportJson: () => string;
   importJson: (raw: string) => void;
   importMarkdownPrompts: (candidates: MdImportCandidate[]) => void;
+  connectPromptFolder: () => Promise<void>;
+  disconnectPromptFolder: () => Promise<void>;
+  rescanPromptFolder: () => Promise<void>;
+  overwritePromptToFolder: (id: string) => Promise<void>;
+  importPromptFromFolder: (id: string) => Promise<void>;
+  disconnectPromptFromFolder: (id: string) => void;
+  getPromptSyncStatus: (prompt: Prompt) => PromptSyncStatus;
 };
 
 const UNCATEGORIZED_ID = "uncategorized";
 const STORAGE_KEY = "prompter.prompts.v1";
+const FOLDER_SYNC_STATE_KEY = "prompter.folderSync.v1";
 const QUICK_SAVE_ENABLED_KEY = "prompter.quickSaveEnabled";
 const LANGUAGE_KEY = "prompter.language";
 const LEGACY_JSON_EXPORT_ENABLED_KEY = "prompter.legacyJsonExportEnabled";
+const HANDLE_DB_NAME = "prompter-handles";
+const HANDLE_STORE_NAME = "handles";
+const HANDLE_KEY = "prompt-folder";
 const chromeApi = (globalThis as { chrome?: any }).chrome;
 const hasExtensionStorage = Boolean(chromeApi?.storage?.local);
 const DEFAULT_UNCATEGORIZED_LABEL = "Bez kategorii";
@@ -164,6 +194,15 @@ function markdownExportPath(prompt: Prompt, categoryName: string) {
   const folderParts = [
     MARKDOWN_EXPORT_ROOT,
     sanitizePathSegment(categoryName || DEFAULT_UNCATEGORIZED_LABEL),
+    ...prompt.tags.map(sanitizePathSegment)
+  ];
+  const fileName = `${sanitizePathSegment(prompt.title)}.md`;
+  return [...folderParts, fileName].join("/");
+}
+
+function folderPromptPath(prompt: Pick<Prompt, "title" | "tags">, categoryName: string) {
+  const folderParts = [
+    ...(categoryName && categoryName !== DEFAULT_UNCATEGORIZED_LABEL ? [sanitizePathSegment(categoryName)] : []),
     ...prompt.tags.map(sanitizePathSegment)
   ];
   const fileName = `${sanitizePathSegment(prompt.title)}.md`;
@@ -291,13 +330,165 @@ async function markdownCandidateFromFile(file: File) {
   } satisfies MdImportCandidate;
 }
 
-async function writePromptMarkdownToDirectory(
-  rootHandle: any,
-  prompt: Prompt,
-  categoryName: string
-) {
-  const relativePath = markdownExportPath(prompt, categoryName);
-  const parts = relativePath.split("/").filter(Boolean);
+function markdownCandidateFromRelativePath(sourcePath: string, content: string) {
+  const normalized = normalizeSourcePath(sourcePath);
+  if (!normalized) return null;
+  const parts = normalized.split("/");
+  const fileName = parts[parts.length - 1] || "prompt.md";
+  const title = titleFromMarkdownFile(fileName, content);
+  const categoryName = parts.length >= 2 ? parts[0] : DEFAULT_UNCATEGORIZED_LABEL;
+  const tags = uniqueSortedTags(parts.length >= 3 ? parts.slice(1, -1) : []);
+
+  return {
+    sourcePath: normalized,
+    categoryName,
+    title,
+    content: content.trim(),
+    tags
+  } satisfies MdImportCandidate;
+}
+
+function textHash(content: string) {
+  const bytes = new TextEncoder().encode(content);
+  return crc32(bytes).toString(16).padStart(8, "0");
+}
+
+function defaultFolderSyncState(): FolderSyncState {
+  return {
+    connected: false,
+    folderName: null,
+    lastScannedAt: null,
+    records: {}
+  };
+}
+
+function normalizeFolderSyncState(input: FolderSyncState | null | undefined): FolderSyncState {
+  return {
+    connected: Boolean(input?.connected),
+    folderName: typeof input?.folderName === "string" && input.folderName.trim() ? input.folderName.trim() : null,
+    lastScannedAt: typeof input?.lastScannedAt === "string" && input.lastScannedAt ? input.lastScannedAt : null,
+    records: Object.fromEntries(
+      Object.entries(input?.records ?? {})
+        .map(([sourcePath, record]) => {
+          const normalizedPath = normalizeSourcePath(sourcePath);
+          if (!normalizedPath) return null;
+          return [normalizedPath, {
+            sourcePath: normalizedPath,
+            lastSyncedHash: typeof record?.lastSyncedHash === "string" ? record.lastSyncedHash : "",
+            lastSyncedAt: typeof record?.lastSyncedAt === "string" && record.lastSyncedAt ? record.lastSyncedAt : nowIso(),
+            missing: Boolean(record?.missing),
+            conflict: Boolean(record?.conflict),
+            fileHash: typeof record?.fileHash === "string" && record.fileHash ? record.fileHash : null
+          } satisfies FolderSyncRecord] as const;
+        })
+        .filter((entry): entry is readonly [string, FolderSyncRecord] => entry !== null)
+    )
+  };
+}
+
+function openHandleDb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(HANDLE_DB_NAME, 1);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(HANDLE_STORE_NAME)) {
+        db.createObjectStore(HANDLE_STORE_NAME);
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error ?? new Error("IndexedDB open failed"));
+  });
+}
+
+async function idbGet<T>(key: string): Promise<T | null> {
+  const db = await openHandleDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(HANDLE_STORE_NAME, "readonly");
+    const store = tx.objectStore(HANDLE_STORE_NAME);
+    const request = store.get(key);
+    request.onsuccess = () => resolve((request.result as T | undefined) ?? null);
+    request.onerror = () => reject(request.error ?? new Error("IndexedDB read failed"));
+  });
+}
+
+async function idbSet(key: string, value: unknown): Promise<void> {
+  const db = await openHandleDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(HANDLE_STORE_NAME, "readwrite");
+    const store = tx.objectStore(HANDLE_STORE_NAME);
+    const request = store.put(value, key);
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error ?? new Error("IndexedDB write failed"));
+  });
+}
+
+async function idbDelete(key: string): Promise<void> {
+  const db = await openHandleDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(HANDLE_STORE_NAME, "readwrite");
+    const store = tx.objectStore(HANDLE_STORE_NAME);
+    const request = store.delete(key);
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error ?? new Error("IndexedDB delete failed"));
+  });
+}
+
+async function loadPromptFolderHandle(): Promise<any | null> {
+  try {
+    return await idbGet<any>(HANDLE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+async function savePromptFolderHandle(handle: any): Promise<void> {
+  await idbSet(HANDLE_KEY, handle);
+}
+
+async function clearPromptFolderHandle(): Promise<void> {
+  await idbDelete(HANDLE_KEY);
+}
+
+async function ensureHandlePermission(handle: any, mode: "read" | "readwrite") {
+  if (!handle?.queryPermission || !handle?.requestPermission) return true;
+  const options = { mode };
+  if (await handle.queryPermission(options) === "granted") return true;
+  return (await handle.requestPermission(options)) === "granted";
+}
+
+async function getFileHandleByRelativePath(rootHandle: any, relativePath: string) {
+  const normalized = normalizeSourcePath(relativePath);
+  if (!normalized) return null;
+  const parts = normalized.split("/");
+  let currentHandle = rootHandle;
+  for (const segment of parts.slice(0, -1)) {
+    currentHandle = await currentHandle.getDirectoryHandle(segment);
+  }
+  return currentHandle.getFileHandle(parts[parts.length - 1]);
+}
+
+async function readFileContentFromDirectory(rootHandle: any, relativePath: string) {
+  const fileHandle = await getFileHandleByRelativePath(rootHandle, relativePath);
+  if (!fileHandle) return null;
+  const file = await fileHandle.getFile();
+  return file.text();
+}
+
+async function deleteFileFromDirectory(rootHandle: any, relativePath: string) {
+  const normalized = normalizeSourcePath(relativePath);
+  if (!normalized) return;
+  const parts = normalized.split("/");
+  let currentHandle = rootHandle;
+  for (const segment of parts.slice(0, -1)) {
+    currentHandle = await currentHandle.getDirectoryHandle(segment);
+  }
+  await currentHandle.removeEntry(parts[parts.length - 1]);
+}
+
+async function writePromptMarkdownToDirectory(rootHandle: any, relativePath: string, content: string) {
+  const normalized = normalizeSourcePath(relativePath);
+  if (!normalized) return;
+  const parts = normalized.split("/").filter(Boolean);
   if (parts.length === 0) return;
 
   let currentHandle = rootHandle;
@@ -310,8 +501,31 @@ async function writePromptMarkdownToDirectory(
     create: true
   });
   const writable = await fileHandle.createWritable();
-  await writable.write(prompt.content);
+  await writable.write(content);
   await writable.close();
+}
+
+async function collectMarkdownCandidatesFromDirectoryHandle(rootHandle: any): Promise<MdImportCandidate[]> {
+  const candidates: MdImportCandidate[] = [];
+
+  async function walk(currentHandle: any, prefix = ""): Promise<void> {
+    for await (const [name, handle] of currentHandle.entries()) {
+      const nextPath = prefix ? `${prefix}/${name}` : name;
+      if (handle.kind === "directory") {
+        await walk(handle, nextPath);
+        continue;
+      }
+      if (!/\.md$/i.test(name)) continue;
+      const file = await handle.getFile();
+      const content = (await file.text()).trim();
+      if (!content) continue;
+      const candidate = markdownCandidateFromRelativePath(nextPath, content);
+      if (candidate) candidates.push(candidate);
+    }
+  }
+
+  await walk(rootHandle);
+  return candidates.sort((a, b) => a.sourcePath.localeCompare(b.sourcePath, "pl", { sensitivity: "base" }));
 }
 
 function createDraft(): PromptDraft {
@@ -456,6 +670,27 @@ async function writeStoredDbRaw(json: string): Promise<void> {
   localStorage.setItem(STORAGE_KEY, json);
 }
 
+async function readStoredFolderSyncRaw(): Promise<string | null> {
+  if (hasExtensionStorage) {
+    const result = await chromeApi.storage.local.get([FOLDER_SYNC_STATE_KEY]);
+    const value = result?.[FOLDER_SYNC_STATE_KEY];
+    if (typeof value === "string") return value;
+    if (value && typeof value === "object") return JSON.stringify(value);
+    return null;
+  }
+
+  return localStorage.getItem(FOLDER_SYNC_STATE_KEY);
+}
+
+async function writeStoredFolderSyncRaw(json: string): Promise<void> {
+  if (hasExtensionStorage) {
+    await chromeApi.storage.local.set({ [FOLDER_SYNC_STATE_KEY]: json });
+    return;
+  }
+
+  localStorage.setItem(FOLDER_SYNC_STATE_KEY, json);
+}
+
 async function loadDb(): Promise<DbFile> {
   const raw = await readStoredDbRaw();
   if (!raw) {
@@ -472,6 +707,26 @@ async function loadDb(): Promise<DbFile> {
   } catch {
     const fallback = defaultDb();
     await writeStoredDbRaw(JSON.stringify(fallback));
+    return fallback;
+  }
+}
+
+async function loadFolderSyncState(): Promise<FolderSyncState> {
+  const raw = await readStoredFolderSyncRaw();
+  if (!raw) {
+    const initial = defaultFolderSyncState();
+    await writeStoredFolderSyncRaw(JSON.stringify(initial));
+    return initial;
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as FolderSyncState;
+    const normalized = normalizeFolderSyncState(parsed);
+    await writeStoredFolderSyncRaw(JSON.stringify(normalized));
+    return normalized;
+  } catch {
+    const fallback = defaultFolderSyncState();
+    await writeStoredFolderSyncRaw(JSON.stringify(fallback));
     return fallback;
   }
 }
@@ -629,19 +884,218 @@ function useLegacyJsonExportSetting() {
   return { legacyJsonExportEnabled, updateLegacyJsonExportEnabled };
 }
 
+function ensureCategoryIdForName(
+  categories: Category[],
+  categoryIdByName: Map<string, string>,
+  categoryName: string,
+  now: string
+) {
+  const trimmed = categoryName.trim() || DEFAULT_UNCATEGORIZED_LABEL;
+  if (trimmed === DEFAULT_UNCATEGORIZED_LABEL) return UNCATEGORIZED_ID;
+  const lookupKey = trimmed.toLowerCase();
+  const existingId = categoryIdByName.get(lookupKey);
+  if (existingId) return existingId;
+  const categoryId = uuid();
+  categories.push({ id: categoryId, name: trimmed, createdAt: now });
+  categoryIdByName.set(lookupKey, categoryId);
+  return categoryId;
+}
+
+function promptSyncStatus(prompt: Prompt, sync: FolderSyncState): PromptSyncStatus {
+  const sourcePath = normalizeSourcePath(prompt.sourcePath);
+  if (!sourcePath) return "local_only";
+  const record = sync.records[sourcePath];
+  if (record?.conflict) return "conflict";
+  if (record?.missing) return "missing_file";
+  if (record?.lastSyncedHash && record.lastSyncedHash === textHash(prompt.content)) return "synced";
+  return "local_only";
+}
+
+function syncLabel(status: PromptSyncStatus, isPl: boolean) {
+  if (status === "conflict") return isPl ? "Konflikt" : "Conflict";
+  if (status === "missing_file") return isPl ? "Brak pliku" : "Missing file";
+  if (status === "synced") return isPl ? "Zsynchronizowany" : "Synced";
+  return isPl ? "Tylko w rozszerzeniu" : "Local only";
+}
+
+function generatePromptSourcePath(db: DbFile, prompt: Pick<Prompt, "id" | "title" | "tags" | "categoryId">) {
+  const categoryName = db.categories.find((category) => category.id === prompt.categoryId)?.name ?? DEFAULT_UNCATEGORIZED_LABEL;
+  const basePath = folderPromptPath(prompt, categoryName);
+  const existingPaths = new Set(
+    db.prompts
+      .filter((item) => item.id !== prompt.id)
+      .map((item) => normalizeSourcePath(item.sourcePath))
+      .filter((path): path is string => Boolean(path))
+  );
+
+  if (!existingPaths.has(basePath)) return basePath;
+
+  const fileName = basePath.split("/").pop() ?? "prompt.md";
+  const fileBase = stripMarkdownExtension(fileName);
+  const parent = basePath.includes("/") ? `${basePath.slice(0, basePath.lastIndexOf("/"))}/` : "";
+
+  let suffix = 2;
+  while (existingPaths.has(`${parent}${fileBase}-${suffix}.md`)) {
+    suffix += 1;
+  }
+  return `${parent}${fileBase}-${suffix}.md`;
+}
+
+function applyFolderCandidatesToDb(
+  current: DbFile,
+  sync: FolderSyncState,
+  candidates: MdImportCandidate[]
+) {
+  const categories = [...current.categories];
+  const categoryIdByName = new Map(
+    categories.map((category) => [category.name.trim().toLowerCase(), category.id] as const)
+  );
+  const prompts = [...current.prompts];
+  const promptIndexBySourcePath = new Map<string, number>();
+  const now = nowIso();
+  const nextRecords = { ...sync.records };
+  const seenPaths = new Set<string>();
+
+  for (let index = 0; index < prompts.length; index += 1) {
+    const sourcePath = normalizeSourcePath(prompts[index].sourcePath);
+    if (sourcePath) promptIndexBySourcePath.set(sourcePath, index);
+  }
+
+  for (const candidate of candidates) {
+    const sourcePath = normalizeSourcePath(candidate.sourcePath);
+    if (!sourcePath) continue;
+    seenPaths.add(sourcePath);
+    const fileHash = textHash(candidate.content);
+    const existingIndex = promptIndexBySourcePath.get(sourcePath);
+
+    if (existingIndex === undefined) {
+      const categoryId = ensureCategoryIdForName(categories, categoryIdByName, candidate.categoryName, now);
+      prompts.push({
+        id: uuid(),
+        title: candidate.title.trim() || "Nowy prompt",
+        categoryId,
+        content: candidate.content.trim(),
+        tags: uniqueSortedTags(candidate.tags),
+        sourcePath,
+        favorite: false,
+        createdAt: now,
+        updatedAt: now,
+        lastUsedAt: null
+      });
+      promptIndexBySourcePath.set(sourcePath, prompts.length - 1);
+      nextRecords[sourcePath] = {
+        sourcePath,
+        lastSyncedHash: fileHash,
+        lastSyncedAt: now,
+        missing: false,
+        conflict: false,
+        fileHash
+      };
+      continue;
+    }
+
+    const existingPrompt = prompts[existingIndex];
+    const promptHash = textHash(existingPrompt.content);
+    const record = nextRecords[sourcePath];
+    const hasConflict = record
+      ? fileHash !== record.lastSyncedHash && promptHash !== record.lastSyncedHash
+      : fileHash !== promptHash;
+
+    if (hasConflict) {
+      nextRecords[sourcePath] = {
+        sourcePath,
+        lastSyncedHash: record?.lastSyncedHash ?? promptHash,
+        lastSyncedAt: record?.lastSyncedAt ?? existingPrompt.updatedAt,
+        missing: false,
+        conflict: true,
+        fileHash
+      };
+      continue;
+    }
+
+    if (fileHash !== promptHash || record?.missing || record?.conflict) {
+      const categoryId = ensureCategoryIdForName(categories, categoryIdByName, candidate.categoryName, now);
+      prompts[existingIndex] = {
+        ...existingPrompt,
+        title: candidate.title.trim() || existingPrompt.title,
+        categoryId,
+        content: candidate.content.trim(),
+        tags: uniqueSortedTags(candidate.tags),
+        sourcePath,
+        updatedAt: now
+      };
+    }
+
+    nextRecords[sourcePath] = {
+      sourcePath,
+      lastSyncedHash: fileHash,
+      lastSyncedAt: now,
+      missing: false,
+      conflict: false,
+      fileHash
+    };
+  }
+
+  for (const prompt of prompts) {
+    const sourcePath = normalizeSourcePath(prompt.sourcePath);
+    if (!sourcePath || seenPaths.has(sourcePath)) continue;
+    const currentRecord = nextRecords[sourcePath];
+    nextRecords[sourcePath] = {
+      sourcePath,
+      lastSyncedHash: currentRecord?.lastSyncedHash ?? textHash(prompt.content),
+      lastSyncedAt: currentRecord?.lastSyncedAt ?? prompt.updatedAt,
+      missing: true,
+      conflict: false,
+      fileHash: null
+    };
+  }
+
+  return {
+    db: normalizeDb({
+      ...current,
+      categories,
+      prompts
+    }),
+    sync: normalizeFolderSyncState({
+      ...sync,
+      lastScannedAt: now,
+      records: nextRecords
+    })
+  };
+}
+
 function useLibrary(language: Language): LibraryApi {
   const [loading, setLoading] = useState(true);
   const [db, setDb] = useState<DbFile>(() => defaultDb());
+  const [sync, setSync] = useState<FolderSyncState>(() => defaultFolderSyncState());
+  const [syncBusy, setSyncBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  const dbRef = useRef(db);
+  const syncRef = useRef(sync);
+  const folderHandleRef = useRef<any | null>(null);
+
+  useEffect(() => {
+    dbRef.current = db;
+  }, [db]);
+
+  useEffect(() => {
+    syncRef.current = sync;
+  }, [sync]);
 
   useEffect(() => {
     let active = true;
 
     void (async () => {
-      const loaded = await loadDb();
+      const [loadedDb, loadedSync, handle] = await Promise.all([
+        loadDb(),
+        loadFolderSyncState(),
+        loadPromptFolderHandle()
+      ]);
       if (!active) return;
-      setDb(loaded);
+      folderHandleRef.current = handle;
+      setDb(loadedDb);
+      setSync(handle ? loadedSync : defaultFolderSyncState());
       setLoading(false);
     })();
 
@@ -658,12 +1112,20 @@ function useLibrary(language: Language): LibraryApi {
 
   function commit(mutator: (prev: DbFile) => DbFile, toastMessage?: string) {
     setError(null);
-    setDb((prev) => {
-      const next = normalizeDb(mutator(prev));
-      void writeStoredDbRaw(JSON.stringify(next));
-      return next;
-    });
+    const next = normalizeDb(mutator(dbRef.current));
+    dbRef.current = next;
+    setDb(next);
+    void writeStoredDbRaw(JSON.stringify(next));
     if (toastMessage) setToast(toastMessage);
+    return next;
+  }
+
+  function commitSync(mutator: (prev: FolderSyncState) => FolderSyncState) {
+    const next = normalizeFolderSyncState(mutator(syncRef.current));
+    syncRef.current = next;
+    setSync(next);
+    void writeStoredFolderSyncRaw(JSON.stringify(next));
+    return next;
   }
 
   function withValidation(action: () => void) {
@@ -692,16 +1154,7 @@ function useLibrary(language: Language): LibraryApi {
     for (const candidate of candidates) {
       const sourcePath = normalizeSourcePath(candidate.sourcePath);
       if (!sourcePath) continue;
-
-      const categoryName = candidate.categoryName.trim() || DEFAULT_UNCATEGORIZED_LABEL;
-      const categoryLookupKey = categoryName.toLowerCase();
-      let categoryId = categoryIdByName.get(categoryLookupKey) ?? null;
-      if (!categoryId) {
-        categoryId = uuid();
-        categories.push({ id: categoryId, name: categoryName, createdAt: now });
-        categoryIdByName.set(categoryLookupKey, categoryId);
-      }
-
+      const categoryId = ensureCategoryIdForName(categories, categoryIdByName, candidate.categoryName, now);
       const tags = uniqueSortedTags(candidate.tags);
       const existingIndex = promptIndexBySourcePath.get(sourcePath);
 
@@ -741,9 +1194,99 @@ function useLibrary(language: Language): LibraryApi {
     };
   }
 
+  async function writePromptToConnectedFolder(promptId: string) {
+    const rootHandle = folderHandleRef.current;
+    if (!rootHandle || !syncRef.current.connected) return;
+    if (!await ensureHandlePermission(rootHandle, "readwrite")) {
+      throw new Error(txt(language, "Brak dostępu do zapisu w katalogu promptów", "Write access to the prompts folder was not granted"));
+    }
+
+    const prompt = dbRef.current.prompts.find((item) => item.id === promptId);
+    if (!prompt) return;
+    const sourcePath = normalizeSourcePath(prompt.sourcePath);
+    if (!sourcePath) return;
+
+    await writePromptMarkdownToDirectory(rootHandle, sourcePath, prompt.content);
+    const fileHash = textHash(prompt.content);
+    commitSync((prev) => ({
+      ...prev,
+      connected: true,
+      folderName: rootHandle.name ?? prev.folderName,
+      records: {
+        ...prev.records,
+        [sourcePath]: {
+          sourcePath,
+          lastSyncedHash: fileHash,
+          lastSyncedAt: nowIso(),
+          missing: false,
+          conflict: false,
+          fileHash
+        }
+      }
+    }));
+  }
+
+  async function deletePromptFromConnectedFolder(sourcePath: string | null) {
+    const rootHandle = folderHandleRef.current;
+    const normalizedPath = normalizeSourcePath(sourcePath);
+    if (!rootHandle || !syncRef.current.connected || !normalizedPath) return;
+    if (!await ensureHandlePermission(rootHandle, "readwrite")) return;
+    try {
+      await deleteFileFromDirectory(rootHandle, normalizedPath);
+    } catch {
+      return;
+    }
+    commitSync((prev) => {
+      const nextRecords = { ...prev.records };
+      delete nextRecords[normalizedPath];
+      return { ...prev, records: nextRecords };
+    });
+  }
+
+  async function rescanPromptFolder() {
+    const rootHandle = folderHandleRef.current;
+    if (!rootHandle) {
+      setError(txt(language, "Nie podłączono katalogu promptów", "No prompts folder is connected"));
+      return;
+    }
+
+    setSyncBusy(true);
+    setError(null);
+    try {
+      if (!await ensureHandlePermission(rootHandle, "read")) {
+        throw new Error(txt(language, "Brak dostępu do odczytu katalogu promptów", "Read access to the prompts folder was not granted"));
+      }
+
+      const candidates = await collectMarkdownCandidatesFromDirectoryHandle(rootHandle);
+      const result = applyFolderCandidatesToDb(
+        dbRef.current,
+        {
+          ...syncRef.current,
+          connected: true,
+          folderName: rootHandle.name ?? syncRef.current.folderName
+        },
+        candidates
+      );
+
+      dbRef.current = result.db;
+      setDb(result.db);
+      void writeStoredDbRaw(JSON.stringify(result.db));
+      syncRef.current = result.sync;
+      setSync(result.sync);
+      void writeStoredFolderSyncRaw(JSON.stringify(result.sync));
+      setToast(txt(language, "Zsynchronizowano katalog promptów", "Prompts folder synced"));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : txt(language, "Synchronizacja katalogu nie powiodła się", "Folder sync failed"));
+    } finally {
+      setSyncBusy(false);
+    }
+  }
+
   return {
     loading,
     db,
+    sync,
+    syncBusy,
     error,
     toast,
     clearError: () => setError(null),
@@ -755,16 +1298,14 @@ function useLibrary(language: Language): LibraryApi {
 
       const promptId = draft.id || uuid();
       withValidation(() => {
-        commit((prev) => {
+        const nextDb = commit((prev) => {
           const now = nowIso();
           const categoryId = prev.categories.some((c) => c.id === draft.categoryId)
             ? draft.categoryId
             : UNCATEGORIZED_ID;
-          const tags = Array.from(new Set(draft.tags.map((tag) => tag.trim()).filter(Boolean))).sort(
-            (a, b) => a.localeCompare(b, "pl", { sensitivity: "base" })
-          );
-
+          const tags = uniqueSortedTags(draft.tags);
           const existing = prev.prompts.find((p) => p.id === promptId);
+
           if (existing) {
             return {
               ...prev,
@@ -777,6 +1318,9 @@ function useLibrary(language: Language): LibraryApi {
                       content: draft.content.trim(),
                       tags,
                       favorite: draft.favorite,
+                      sourcePath: existing.sourcePath ?? (syncRef.current.connected
+                        ? generatePromptSourcePath(prev, { id: promptId, title: draft.title.trim(), tags, categoryId })
+                        : null),
                       updatedAt: now
                     }
                   : p
@@ -794,7 +1338,9 @@ function useLibrary(language: Language): LibraryApi {
                 categoryId,
                 content: draft.content.trim(),
                 tags,
-                sourcePath: null,
+                sourcePath: syncRef.current.connected
+                  ? generatePromptSourcePath(prev, { id: promptId, title: draft.title.trim(), tags, categoryId })
+                  : null,
                 favorite: draft.favorite,
                 createdAt: now,
                 updatedAt: now,
@@ -802,7 +1348,13 @@ function useLibrary(language: Language): LibraryApi {
               }
             ]
           };
-        }, txt(language, "Zapisano", "Saved"))
+        }, txt(language, "Zapisano", "Saved"));
+
+        if (syncRef.current.connected && nextDb.prompts.some((prompt) => prompt.id === promptId)) {
+          void writePromptToConnectedFolder(promptId).catch((e) => {
+            setError(e instanceof Error ? e.message : txt(language, "Nie udało się zapisać promptu do katalogu", "Could not save prompt to folder"));
+          });
+        }
       });
 
       return promptId;
@@ -813,7 +1365,6 @@ function useLibrary(language: Language): LibraryApi {
           const existing = prev.prompts.find((p) => p.id === id);
           if (!existing) throw new Error(txt(language, "Prompt nie istnieje", "Prompt does not exist"));
           const now = nowIso();
-
           return {
             ...prev,
             prompts: prev.prompts.map((p) =>
@@ -825,6 +1376,7 @@ function useLibrary(language: Language): LibraryApi {
     },
     deletePrompt: (id) => {
       withValidation(() => {
+        const sourcePath = dbRef.current.prompts.find((p) => p.id === id)?.sourcePath ?? null;
         commit(
           (prev) => ({
             ...prev,
@@ -832,6 +1384,7 @@ function useLibrary(language: Language): LibraryApi {
           }),
           txt(language, "Usunięto prompt", "Prompt deleted")
         );
+        void deletePromptFromConnectedFolder(sourcePath);
       });
     },
     duplicatePrompt: (id) => {
@@ -841,7 +1394,6 @@ function useLibrary(language: Language): LibraryApi {
           const original = prev.prompts.find((p) => p.id === id);
           if (!original) throw new Error(txt(language, "Prompt nie istnieje", "Prompt does not exist"));
           const now = nowIso();
-
           return {
             ...prev,
             prompts: [
@@ -859,16 +1411,14 @@ function useLibrary(language: Language): LibraryApi {
           };
         }, txt(language, "Zduplikowano", "Duplicated"));
       });
-
       return copyId;
     },
     copyPrompt: async (id) => {
-      const prompt = db.prompts.find((p) => p.id === id);
+      const prompt = dbRef.current.prompts.find((p) => p.id === id);
       if (!prompt) {
         setError(txt(language, "Prompt nie istnieje", "Prompt does not exist"));
         return;
       }
-
       try {
         await navigator.clipboard.writeText(prompt.content);
       } catch {
@@ -893,12 +1443,10 @@ function useLibrary(language: Language): LibraryApi {
       withValidation(() => {
         const trimmed = name.trim();
         if (!trimmed) throw new Error(txt(language, "Nazwa kategorii jest wymagana", "Category name is required"));
-
         commit((prev) => {
           if (prev.categories.some((c) => c.name.toLowerCase() === trimmed.toLowerCase())) {
             throw new Error(txt(language, "Kategoria o tej nazwie już istnieje", "Category with this name already exists"));
           }
-
           return {
             ...prev,
             categories: [...prev.categories, { id: uuid(), name: trimmed, createdAt: nowIso() }]
@@ -913,16 +1461,13 @@ function useLibrary(language: Language): LibraryApi {
         if (id === UNCATEGORIZED_ID) {
           throw new Error(txt(language, "Nie można zmienić nazwy kategorii Bez kategorii", "Cannot rename the default uncategorized category"));
         }
-
         commit((prev) => {
           if (prev.categories.some((c) => c.id !== id && c.name.toLowerCase() === trimmed.toLowerCase())) {
             throw new Error(txt(language, "Kategoria o tej nazwie już istnieje", "Category with this name already exists"));
           }
-
           if (!prev.categories.some((c) => c.id === id)) {
             throw new Error(txt(language, "Kategoria nie istnieje", "Category does not exist"));
           }
-
           return {
             ...prev,
             categories: prev.categories.map((c) => (c.id === id ? { ...c, name: trimmed } : c))
@@ -935,7 +1480,6 @@ function useLibrary(language: Language): LibraryApi {
         if (id === UNCATEGORIZED_ID) {
           throw new Error(txt(language, "Nie można usunąć kategorii Bez kategorii", "Cannot delete the default uncategorized category"));
         }
-
         commit((prev) => {
           if (!prev.categories.some((c) => c.id === id)) {
             throw new Error(txt(language, "Kategoria nie istnieje", "Category does not exist"));
@@ -956,17 +1500,14 @@ function useLibrary(language: Language): LibraryApi {
         if (uniqueIds.length === 0) {
           throw new Error(txt(language, "Nie wybrano kategorii do usunięcia", "No categories selected for deletion"));
         }
-
         commit((prev) => {
           const existingIds = new Set(prev.categories.map((c) => c.id));
           const missingId = uniqueIds.find((id) => !existingIds.has(id));
           if (missingId) {
             throw new Error(txt(language, "Kategoria nie istnieje", "Category does not exist"));
           }
-
           const idsToDelete = new Set(uniqueIds);
           const now = nowIso();
-
           return {
             ...prev,
             categories: prev.categories.filter((c) => !idsToDelete.has(c.id)),
@@ -983,7 +1524,6 @@ function useLibrary(language: Language): LibraryApi {
         if (uniqueSourceIds.length === 0) {
           throw new Error(txt(language, "Nie wybrano kategorii źródłowych", "No source categories selected"));
         }
-
         commit((prev) => {
           const existingIds = new Set(prev.categories.map((c) => c.id));
           if (!existingIds.has(targetId)) {
@@ -992,15 +1532,12 @@ function useLibrary(language: Language): LibraryApi {
           if (uniqueSourceIds.includes(targetId)) {
             throw new Error(txt(language, "Kategoria docelowa nie może być jedną z zaznaczonych", "Target category cannot be selected"));
           }
-
           const missingId = uniqueSourceIds.find((id) => !existingIds.has(id));
           if (missingId) {
             throw new Error(txt(language, "Kategoria nie istnieje", "Category does not exist"));
           }
-
           const sourceSet = new Set(uniqueSourceIds);
           const now = nowIso();
-
           return {
             ...prev,
             prompts: prev.prompts.map((p) =>
@@ -1016,7 +1553,6 @@ function useLibrary(language: Language): LibraryApi {
         if (uniqueSourceIds.length === 0) {
           throw new Error(txt(language, "Nie wybrano kategorii do scalenia", "No categories selected to merge"));
         }
-
         commit((prev) => {
           const existingIds = new Set(prev.categories.map((c) => c.id));
           if (!existingIds.has(targetId)) {
@@ -1025,15 +1561,12 @@ function useLibrary(language: Language): LibraryApi {
           if (uniqueSourceIds.includes(targetId)) {
             throw new Error(txt(language, "Kategoria docelowa nie może być jedną z zaznaczonych", "Target category cannot be selected"));
           }
-
           const missingId = uniqueSourceIds.find((id) => !existingIds.has(id));
           if (missingId) {
             throw new Error(txt(language, "Kategoria nie istnieje", "Category does not exist"));
           }
-
           const sourceSet = new Set(uniqueSourceIds);
           const now = nowIso();
-
           return {
             ...prev,
             categories: prev.categories.filter((c) => !sourceSet.has(c.id)),
@@ -1044,7 +1577,7 @@ function useLibrary(language: Language): LibraryApi {
         }, txt(language, "Scalono kategorie", "Categories merged"));
       });
     },
-    exportJson: () => JSON.stringify(db, null, 2),
+    exportJson: () => JSON.stringify(dbRef.current, null, 2),
     importJson: (raw) => {
       withValidation(() => {
         const parsed = JSON.parse(raw) as DbFile;
@@ -1062,7 +1595,102 @@ function useLibrary(language: Language): LibraryApi {
           txt(language, "Zaimportowano pliki Markdown", "Imported Markdown files")
         );
       });
-    }
+    },
+    connectPromptFolder: async () => {
+      setError(null);
+      try {
+        const picker = (window as Window & { showDirectoryPicker?: () => Promise<any> }).showDirectoryPicker;
+        if (!picker) {
+          throw new Error(txt(language, "Ta przeglądarka nie wspiera wyboru katalogu", "This browser does not support folder picking"));
+        }
+        const handle = await picker();
+        if (!await ensureHandlePermission(handle, "readwrite")) {
+          throw new Error(txt(language, "Nie przyznano dostępu do katalogu", "Folder access was not granted"));
+        }
+        await savePromptFolderHandle(handle);
+        folderHandleRef.current = handle;
+        commitSync(() => ({
+          connected: true,
+          folderName: handle.name ?? null,
+          lastScannedAt: null,
+          records: {}
+        }));
+        await rescanPromptFolder();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : txt(language, "Nie udało się podłączyć katalogu", "Could not connect the folder"));
+      }
+    },
+    disconnectPromptFolder: async () => {
+      await clearPromptFolderHandle();
+      folderHandleRef.current = null;
+      commitSync((prev) => ({
+        ...prev,
+        connected: false,
+        folderName: null,
+        lastScannedAt: null
+      }));
+      setToast(txt(language, "Odłączono katalog promptów", "Prompts folder disconnected"));
+    },
+    rescanPromptFolder,
+    overwritePromptToFolder: async (id) => {
+      try {
+        await writePromptToConnectedFolder(id);
+        setToast(txt(language, "Nadpisano plik promptu", "Prompt file overwritten"));
+      } catch (e) {
+        setError(e instanceof Error ? e.message : txt(language, "Nie udało się nadpisać pliku", "Could not overwrite the file"));
+      }
+    },
+    importPromptFromFolder: async (id) => {
+      const rootHandle = folderHandleRef.current;
+      const prompt = dbRef.current.prompts.find((item) => item.id === id);
+      const sourcePath = normalizeSourcePath(prompt?.sourcePath);
+      if (!rootHandle || !sourcePath || !prompt) {
+        setError(txt(language, "Nie można wczytać pliku dla tego promptu", "Cannot import the file for this prompt"));
+        return;
+      }
+      try {
+        if (!await ensureHandlePermission(rootHandle, "read")) {
+          throw new Error(txt(language, "Brak dostępu do odczytu katalogu promptów", "Read access to the prompts folder was not granted"));
+        }
+        const content = await readFileContentFromDirectory(rootHandle, sourcePath);
+        if (content === null) {
+          throw new Error(txt(language, "Plik promptu nie istnieje", "Prompt file does not exist"));
+        }
+        const candidate = markdownCandidateFromRelativePath(sourcePath, content);
+        if (!candidate) {
+          throw new Error(txt(language, "Nie udało się odczytać pliku promptu", "Could not parse the prompt file"));
+        }
+        const result = applyFolderCandidatesToDb(dbRef.current, syncRef.current, [candidate]);
+        dbRef.current = result.db;
+        setDb(result.db);
+        void writeStoredDbRaw(JSON.stringify(result.db));
+        syncRef.current = result.sync;
+        setSync(result.sync);
+        void writeStoredFolderSyncRaw(JSON.stringify(result.sync));
+        setToast(txt(language, "Wczytano zmiany z pliku", "Imported changes from file"));
+      } catch (e) {
+        setError(e instanceof Error ? e.message : txt(language, "Nie udało się wczytać pliku", "Could not import the file"));
+      }
+    },
+    disconnectPromptFromFolder: (id) => {
+      withValidation(() => {
+        const sourcePath = normalizeSourcePath(dbRef.current.prompts.find((prompt) => prompt.id === id)?.sourcePath);
+        commit((prev) => ({
+          ...prev,
+          prompts: prev.prompts.map((prompt) =>
+            prompt.id === id ? { ...prompt, sourcePath: null, updatedAt: nowIso() } : prompt
+          )
+        }), txt(language, "Odłączono prompt od pliku", "Prompt disconnected from file"));
+        if (sourcePath) {
+          commitSync((prev) => {
+            const nextRecords = { ...prev.records };
+            delete nextRecords[sourcePath];
+            return { ...prev, records: nextRecords };
+          });
+        }
+      });
+    },
+    getPromptSyncStatus: (prompt) => promptSyncStatus(prompt, syncRef.current)
   };
 }
 
@@ -1182,6 +1810,7 @@ function PromptsPage({
   const [tagSearch, setTagSearch] = useState("");
   const [selectedCategory, setSelectedCategory] = useState<string>("all");
   const [favoriteOnly, setFavoriteOnly] = useState(false);
+  const [extensionOnly, setExtensionOnly] = useState(false);
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [sortMode, setSortMode] = useState<SortMode>("newest");
   const [selectedPromptId, setSelectedPromptId] = useState<string | null>(null);
@@ -1236,8 +1865,9 @@ function PromptsPage({
       const inSearch = !q || prompt.title.toLowerCase().includes(q) || prompt.content.toLowerCase().includes(q);
       const inCategory = selectedCategory === "all" || prompt.categoryId === selectedCategory;
       const inFavorite = !favoriteOnly || prompt.favorite;
+      const inExtension = !extensionOnly || lib.getPromptSyncStatus(prompt) === "local_only";
       const inTags = selectedTags.every((tag) => prompt.tags.includes(tag));
-      return inSearch && inCategory && inFavorite && inTags;
+      return inSearch && inCategory && inFavorite && inExtension && inTags;
     });
 
     const sorted = [...list];
@@ -1253,7 +1883,7 @@ function PromptsPage({
     }
 
     return sorted;
-  }, [favoriteOnly, locale, prompts, search, selectedCategory, selectedTags, sortMode]);
+  }, [extensionOnly, favoriteOnly, lib, locale, prompts, search, selectedCategory, selectedTags, sortMode]);
 
   const selectedPrompt = useMemo(
     () => prompts.find((prompt) => prompt.id === selectedPromptId) ?? null,
@@ -1289,6 +1919,9 @@ function PromptsPage({
           </label>
           <button className={favoriteOnly ? "ghost active-filter" : "ghost"} onClick={() => setFavoriteOnly((v) => !v)}>
             ⭐ {isPl ? "Ulubione" : "Favorites"}
+          </button>
+          <button className={extensionOnly ? "ghost active-filter" : "ghost"} onClick={() => setExtensionOnly((v) => !v)}>
+            {isPl ? "Tylko w rozszerzeniu" : "Local only"}
           </button>
           <button onClick={() => navigate("create")}>{isPl ? "+ Dodaj prompt" : "+ Add prompt"}</button>
         </div>
@@ -1333,6 +1966,11 @@ function PromptsPage({
             className={selectedPromptId === prompt.id ? "library-card selected" : "library-card"}
             onClick={() => setSelectedPromptId(prompt.id)}
           >
+            {lib.sync.connected && lib.getPromptSyncStatus(prompt) !== "synced" ? (
+              <div className="library-card-status">
+                <span className="chip chip-warning">{syncLabel(lib.getPromptSyncStatus(prompt), isPl)}</span>
+              </div>
+            ) : null}
             <div className="row-between">
               <h3>{prompt.title}</h3>
               <button
@@ -1395,6 +2033,9 @@ function PromptsPage({
             </div>
 
             <div className="tag-cloud">
+              {lib.sync.connected && lib.getPromptSyncStatus(selectedPrompt) !== "synced" ? (
+                <span className="chip chip-warning">{syncLabel(lib.getPromptSyncStatus(selectedPrompt), isPl)}</span>
+              ) : null}
               {selectedPrompt.categoryId !== UNCATEGORIZED_ID ? (
                 <span className="chip">
                   {categoryMap.get(selectedPrompt.categoryId) ?? (isPl ? "Bez kategorii" : "Uncategorized")}
@@ -1982,6 +2623,12 @@ function DataPage({
   const [markdownImportError, setMarkdownImportError] = useState<string | null>(null);
   const [markdownExportBusy, setMarkdownExportBusy] = useState(false);
 
+  useEffect(() => {
+    if (lib.sync.connected) {
+      void lib.rescanPromptFolder();
+    }
+  }, []);
+
   function downloadExport() {
     const blob = new Blob([lib.exportJson()], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -2154,9 +2801,54 @@ function DataPage({
   const previewCount = importPreview?.prompts.length ?? 0;
   const selectedMarkdownCount = selectedMarkdownPaths.length;
   const markdownPreviewCount = markdownImportPreview?.length ?? 0;
+  const syncIssues = useMemo(
+    () => lib.db.prompts.filter((prompt) => {
+      const status = lib.getPromptSyncStatus(prompt);
+      return status === "conflict" || status === "missing_file";
+    }),
+    [lib]
+  );
+  const localOnlyCount = useMemo(
+    () => lib.db.prompts.filter((prompt) => lib.getPromptSyncStatus(prompt) === "local_only").length,
+    [lib]
+  );
+  const syncedCount = useMemo(
+    () => lib.db.prompts.filter((prompt) => lib.getPromptSyncStatus(prompt) === "synced").length,
+    [lib]
+  );
 
   return (
     <div className="data-layout">
+      <section className="surface">
+        <h2>{isPl ? "Synchronizacja katalogu" : "Folder sync"}</h2>
+        <p>
+          {isPl
+            ? "Chrome storage pozostaje główną bazą. Podłączony katalog służy do importu nowych lub zmienionych plików Markdown i do automatycznego zapisu promptów zmienionych w rozszerzeniu."
+            : "Chrome storage remains the primary database. A connected folder is used to import new or changed Markdown files and to automatically save prompts edited in the extension."}
+        </p>
+        <div className="row-gap">
+          <button onClick={() => void lib.connectPromptFolder()}>
+            {lib.sync.connected ? (isPl ? "Zmień katalog" : "Change folder") : (isPl ? "Podłącz katalog" : "Connect folder")}
+          </button>
+          <button className="ghost" onClick={() => void lib.rescanPromptFolder()} disabled={!lib.sync.connected || lib.syncBusy}>
+            {lib.syncBusy
+              ? (isPl ? "Synchronizacja..." : "Syncing...")
+              : (isPl ? "Synchronizuj katalog" : "Sync folder")}
+          </button>
+          <button className="ghost" onClick={() => void lib.disconnectPromptFolder()} disabled={!lib.sync.connected}>
+            {isPl ? "Odłącz katalog" : "Disconnect folder"}
+          </button>
+        </div>
+        <ul className="stats-list">
+          <li>{isPl ? "Status" : "Status"}: {lib.sync.connected ? (isPl ? "podłączony" : "connected") : (isPl ? "niepodłączony" : "not connected")}</li>
+          <li>{isPl ? "Katalog" : "Folder"}: {lib.sync.folderName ?? (isPl ? "brak" : "none")}</li>
+          <li>{isPl ? "Ostatni skan" : "Last scan"}: {lib.sync.lastScannedAt ? new Date(lib.sync.lastScannedAt).toLocaleString() : (isPl ? "jeszcze nie" : "not yet")}</li>
+          <li>{isPl ? "Zsynchronizowane" : "Synced"}: {syncedCount}</li>
+          <li>{isPl ? "Tylko w rozszerzeniu" : "Local only"}: {localOnlyCount}</li>
+          <li>{isPl ? "Problemy synchronizacji" : "Sync issues"}: {syncIssues.length}</li>
+        </ul>
+      </section>
+
       <section className="surface">
         <h2>{isPl ? "Import / Eksport" : "Import / Export"}</h2>
         <p>
@@ -2192,6 +2884,53 @@ function DataPage({
         </div>
         {importError ? <p className="import-error">{importError}</p> : null}
         {markdownImportError ? <p className="import-error">{markdownImportError}</p> : null}
+      </section>
+
+      <section className="surface">
+        <h2>{isPl ? "Problemy synchronizacji" : "Sync issues"}</h2>
+        {syncIssues.length === 0 ? (
+          <p>{isPl ? "Brak konfliktów i brakujących plików." : "No conflicts or missing files."}</p>
+        ) : (
+          <div className="import-list">
+            {syncIssues.map((prompt) => {
+              const status = lib.getPromptSyncStatus(prompt);
+              return (
+                <div key={prompt.id} className="import-item selected">
+                  <div>
+                    <div className="row-between">
+                      <strong>{prompt.title}</strong>
+                      <span className="import-badge update">{syncLabel(status, isPl)}</span>
+                    </div>
+                    <small className="import-path">{prompt.sourcePath}</small>
+                    <p>{prompt.content.slice(0, 120)}{prompt.content.length > 120 ? "..." : ""}</p>
+                    <div className="row-gap">
+                      {status === "conflict" ? (
+                        <>
+                          <button className="ghost" onClick={() => void lib.importPromptFromFolder(prompt.id)}>
+                            {isPl ? "Wczytaj z pliku" : "Import from file"}
+                          </button>
+                          <button onClick={() => void lib.overwritePromptToFolder(prompt.id)}>
+                            {isPl ? "Nadpisz plik" : "Overwrite file"}
+                          </button>
+                        </>
+                      ) : null}
+                      {status === "missing_file" ? (
+                        <>
+                          <button onClick={() => void lib.overwritePromptToFolder(prompt.id)}>
+                            {isPl ? "Zapisz ponownie do katalogu" : "Write back to folder"}
+                          </button>
+                          <button className="ghost" onClick={() => lib.disconnectPromptFromFolder(prompt.id)}>
+                            {isPl ? "Odłącz plik" : "Disconnect file"}
+                          </button>
+                        </>
+                      ) : null}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </section>
 
       {importPreview ? (
