@@ -102,4 +102,4 @@ After code changes:
 
 - The extension stores prompts, tags, categories, settings, and optional folder-sync metadata locally on the user's device.
 - No analytics, tracking, or external network transmission is used by the extension.
-- Publish [PRIVACY.md](https://github.com/MacLes93/prompter-chrome/blob/main/PRIVACY.md) at a public URL and use that URL in the Chrome Web Store privacy policy field before submission.
+- [PRIVACY.md](https://github.com/MacLes93/prompter-chrome/blob/main/PRIVACY.md) contains all privacy related information.
