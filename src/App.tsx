@@ -26,6 +26,8 @@ type DbFile = {
 };
 
 type SortMode = "newest" | "lastUsed" | "az";
+type CategorySortMode = "az" | "countDesc" | "countAsc" | "newest";
+type CategoryBulkAction = "move" | "merge" | "delete";
 
 type PromptDraft = {
   id?: string;
@@ -67,6 +69,9 @@ type LibraryApi = {
   createCategory: (name: string) => void;
   renameCategory: (id: string, name: string) => void;
   deleteCategory: (id: string) => void;
+  deleteCategories: (ids: string[]) => void;
+  movePromptsToCategory: (sourceIds: string[], targetId: string) => void;
+  mergeCategories: (sourceIds: string[], targetId: string) => void;
   exportJson: () => string;
   importJson: (raw: string) => void;
   importMarkdownPrompts: (candidates: MdImportCandidate[]) => void;
@@ -945,6 +950,100 @@ function useLibrary(language: Language): LibraryApi {
         }, txt(language, "Usunięto kategorię", "Category deleted"));
       });
     },
+    deleteCategories: (ids) => {
+      withValidation(() => {
+        const uniqueIds = Array.from(new Set(ids)).filter((id) => id !== UNCATEGORIZED_ID);
+        if (uniqueIds.length === 0) {
+          throw new Error(txt(language, "Nie wybrano kategorii do usunięcia", "No categories selected for deletion"));
+        }
+
+        commit((prev) => {
+          const existingIds = new Set(prev.categories.map((c) => c.id));
+          const missingId = uniqueIds.find((id) => !existingIds.has(id));
+          if (missingId) {
+            throw new Error(txt(language, "Kategoria nie istnieje", "Category does not exist"));
+          }
+
+          const idsToDelete = new Set(uniqueIds);
+          const now = nowIso();
+
+          return {
+            ...prev,
+            categories: prev.categories.filter((c) => !idsToDelete.has(c.id)),
+            prompts: prev.prompts.map((p) =>
+              idsToDelete.has(p.categoryId) ? { ...p, categoryId: UNCATEGORIZED_ID, updatedAt: now } : p
+            )
+          };
+        }, txt(language, "Usunięto zaznaczone kategorie", "Selected categories deleted"));
+      });
+    },
+    movePromptsToCategory: (sourceIds, targetId) => {
+      withValidation(() => {
+        const uniqueSourceIds = Array.from(new Set(sourceIds)).filter(Boolean);
+        if (uniqueSourceIds.length === 0) {
+          throw new Error(txt(language, "Nie wybrano kategorii źródłowych", "No source categories selected"));
+        }
+
+        commit((prev) => {
+          const existingIds = new Set(prev.categories.map((c) => c.id));
+          if (!existingIds.has(targetId)) {
+            throw new Error(txt(language, "Kategoria docelowa nie istnieje", "Target category does not exist"));
+          }
+          if (uniqueSourceIds.includes(targetId)) {
+            throw new Error(txt(language, "Kategoria docelowa nie może być jedną z zaznaczonych", "Target category cannot be selected"));
+          }
+
+          const missingId = uniqueSourceIds.find((id) => !existingIds.has(id));
+          if (missingId) {
+            throw new Error(txt(language, "Kategoria nie istnieje", "Category does not exist"));
+          }
+
+          const sourceSet = new Set(uniqueSourceIds);
+          const now = nowIso();
+
+          return {
+            ...prev,
+            prompts: prev.prompts.map((p) =>
+              sourceSet.has(p.categoryId) ? { ...p, categoryId: targetId, updatedAt: now } : p
+            )
+          };
+        }, txt(language, "Przeniesiono prompty do wybranej kategorii", "Prompts moved to selected category"));
+      });
+    },
+    mergeCategories: (sourceIds, targetId) => {
+      withValidation(() => {
+        const uniqueSourceIds = Array.from(new Set(sourceIds)).filter((id) => id && id !== UNCATEGORIZED_ID);
+        if (uniqueSourceIds.length === 0) {
+          throw new Error(txt(language, "Nie wybrano kategorii do scalenia", "No categories selected to merge"));
+        }
+
+        commit((prev) => {
+          const existingIds = new Set(prev.categories.map((c) => c.id));
+          if (!existingIds.has(targetId)) {
+            throw new Error(txt(language, "Kategoria docelowa nie istnieje", "Target category does not exist"));
+          }
+          if (uniqueSourceIds.includes(targetId)) {
+            throw new Error(txt(language, "Kategoria docelowa nie może być jedną z zaznaczonych", "Target category cannot be selected"));
+          }
+
+          const missingId = uniqueSourceIds.find((id) => !existingIds.has(id));
+          if (missingId) {
+            throw new Error(txt(language, "Kategoria nie istnieje", "Category does not exist"));
+          }
+
+          const sourceSet = new Set(uniqueSourceIds);
+          const now = nowIso();
+
+          return {
+            ...prev,
+            categories: prev.categories.filter((c) => !sourceSet.has(c.id)),
+            prompts: prev.prompts.map((p) =>
+              sourceSet.has(p.categoryId) ? { ...p, categoryId: targetId, updatedAt: now } : p
+            )
+          };
+        }, txt(language, "Scalono kategorie", "Categories merged"));
+      });
+    },
     exportJson: () => JSON.stringify(db, null, 2),
     importJson: (raw) => {
       withValidation(() => {
@@ -1254,11 +1353,11 @@ function PromptsPage({
               </button>
             </div>
             <div className="tag-cloud">
-              <span className="chip">
-                {prompt.categoryId === UNCATEGORIZED_ID
-                  ? (isPl ? "Bez kategorii" : "Uncategorized")
-                  : (categoryMap.get(prompt.categoryId) ?? (isPl ? "Bez kategorii" : "Uncategorized"))}
-              </span>
+              {prompt.categoryId !== UNCATEGORIZED_ID ? (
+                <span className="chip">
+                  {categoryMap.get(prompt.categoryId) ?? (isPl ? "Bez kategorii" : "Uncategorized")}
+                </span>
+              ) : null}
               {prompt.tags.slice(0, 2).map((tag) => (
                 <span key={tag} className="chip chip-purple">
                   {tag}
@@ -1296,11 +1395,11 @@ function PromptsPage({
             </div>
 
             <div className="tag-cloud">
-              <span className="chip">
-                {selectedPrompt.categoryId === UNCATEGORIZED_ID
-                  ? (isPl ? "Bez kategorii" : "Uncategorized")
-                  : (categoryMap.get(selectedPrompt.categoryId) ?? (isPl ? "Bez kategorii" : "Uncategorized"))}
-              </span>
+              {selectedPrompt.categoryId !== UNCATEGORIZED_ID ? (
+                <span className="chip">
+                  {categoryMap.get(selectedPrompt.categoryId) ?? (isPl ? "Bez kategorii" : "Uncategorized")}
+                </span>
+              ) : null}
               {selectedPrompt.tags.map((tag) => (
                 <span key={tag} className="chip chip-purple">{tag}</span>
               ))}
@@ -1507,9 +1606,15 @@ function CreatePromptPage({
 
 function CategoriesPage({ lib, language }: { lib: LibraryApi; language: Language }) {
   const isPl = language === "pl";
+  const locale = isPl ? "pl" : "en";
   const [newName, setNewName] = useState("");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [search, setSearch] = useState("");
+  const [sortMode, setSortMode] = useState<CategorySortMode>("az");
+  const [bulkAction, setBulkAction] = useState<CategoryBulkAction | null>(null);
+  const [targetCategoryId, setTargetCategoryId] = useState<string>(UNCATEGORIZED_ID);
 
   const counts = useMemo(() => {
     const map = new Map<string, number>();
@@ -1519,6 +1624,101 @@ function CategoriesPage({ lib, language }: { lib: LibraryApi; language: Language
     }
     return map;
   }, [lib.db.categories, lib.db.prompts]);
+
+  const selectableCategories = useMemo(
+    () => lib.db.categories.filter((category) => category.id !== UNCATEGORIZED_ID),
+    [lib.db.categories]
+  );
+
+  useEffect(() => {
+    const validIds = new Set(selectableCategories.map((category) => category.id));
+    setSelectedIds((prev) => prev.filter((id) => validIds.has(id)));
+  }, [selectableCategories]);
+
+  const visibleCategories = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    const filtered = lib.db.categories.filter((category) => {
+      if (!query) return true;
+      const label = category.id === UNCATEGORIZED_ID ? (isPl ? "Bez kategorii" : "Uncategorized") : category.name;
+      return label.toLowerCase().includes(query);
+    });
+
+    const sorted = [...filtered];
+    if (sortMode === "az") {
+      sorted.sort((a, b) => {
+        const aName = a.id === UNCATEGORIZED_ID ? (isPl ? "Bez kategorii" : "Uncategorized") : a.name;
+        const bName = b.id === UNCATEGORIZED_ID ? (isPl ? "Bez kategorii" : "Uncategorized") : b.name;
+        return aName.localeCompare(bName, locale, { sensitivity: "base" });
+      });
+    }
+    if (sortMode === "countDesc") {
+      sorted.sort((a, b) => (counts.get(b.id) || 0) - (counts.get(a.id) || 0));
+    }
+    if (sortMode === "countAsc") {
+      sorted.sort((a, b) => (counts.get(a.id) || 0) - (counts.get(b.id) || 0));
+    }
+    if (sortMode === "newest") {
+      sorted.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    }
+
+    return sorted;
+  }, [counts, isPl, lib.db.categories, locale, search, sortMode]);
+
+  const visibleSelectableIds = useMemo(
+    () => visibleCategories.filter((category) => category.id !== UNCATEGORIZED_ID).map((category) => category.id),
+    [visibleCategories]
+  );
+
+  const allVisibleSelected = visibleSelectableIds.length > 0 && visibleSelectableIds.every((id) => selectedIds.includes(id));
+
+  useEffect(() => {
+    if (selectedIds.includes(targetCategoryId)) {
+      const fallback = lib.db.categories.find((category) => !selectedIds.includes(category.id))?.id ?? UNCATEGORIZED_ID;
+      setTargetCategoryId(fallback);
+    }
+  }, [lib.db.categories, selectedIds, targetCategoryId]);
+
+  const availableTargetCategories = useMemo(
+    () => lib.db.categories.filter((category) => !selectedIds.includes(category.id)),
+    [lib.db.categories, selectedIds]
+  );
+
+  const selectedPromptCount = useMemo(
+    () => selectedIds.reduce((sum, id) => sum + (counts.get(id) || 0), 0),
+    [counts, selectedIds]
+  );
+
+  const selectedCategories = useMemo(
+    () => lib.db.categories.filter((category) => selectedIds.includes(category.id)),
+    [lib.db.categories, selectedIds]
+  );
+
+  function categoryLabel(category: Category) {
+    return category.id === UNCATEGORIZED_ID ? (isPl ? "Bez kategorii" : "Uncategorized") : category.name;
+  }
+
+  function closeBulkAction() {
+    setBulkAction(null);
+  }
+
+  function confirmBulkAction() {
+    if (bulkAction === "move") {
+      lib.movePromptsToCategory(selectedIds, targetCategoryId);
+      closeBulkAction();
+      return;
+    }
+    if (bulkAction === "merge") {
+      lib.mergeCategories(selectedIds, targetCategoryId);
+      setSelectedIds([]);
+      closeBulkAction();
+      return;
+    }
+    if (bulkAction === "delete") {
+      lib.deleteCategories(selectedIds);
+      setSelectedIds([]);
+      closeBulkAction();
+    }
+  }
 
   return (
     <div className="surface">
@@ -1530,9 +1730,110 @@ function CategoriesPage({ lib, language }: { lib: LibraryApi; language: Language
         </div>
       </div>
 
+      <div className="category-filters">
+        <input
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder={isPl ? "Szukaj kategorii..." : "Search categories..."}
+        />
+        <select value={sortMode} onChange={(e) => setSortMode(e.target.value as CategorySortMode)}>
+          <option value="az">{isPl ? "Nazwa A-Z" : "Name A-Z"}</option>
+          <option value="countDesc">{isPl ? "Najwięcej promptów" : "Most prompts"}</option>
+          <option value="countAsc">{isPl ? "Najmniej promptów" : "Fewest prompts"}</option>
+          <option value="newest">{isPl ? "Najnowsze" : "Newest"}</option>
+        </select>
+      </div>
+
+      <div className="category-bulk-toolbar">
+        <div className="row-gap">
+          <button
+            type="button"
+            className="ghost"
+            onClick={() =>
+              setSelectedIds((prev) =>
+                allVisibleSelected
+                  ? prev.filter((id) => !visibleSelectableIds.includes(id))
+                  : Array.from(new Set([...prev, ...visibleSelectableIds]))
+              )
+            }
+            disabled={visibleSelectableIds.length === 0}
+          >
+            {allVisibleSelected
+              ? (isPl ? "Odznacz wszystko" : "Clear all")
+              : (isPl ? "Zaznacz wszystko" : "Select all")}
+          </button>
+          <button
+            type="button"
+            className="ghost"
+            onClick={() => setSelectedIds([])}
+            disabled={selectedIds.length === 0}
+          >
+            {isPl ? "Wyczyść zaznaczenie" : "Clear selection"}
+          </button>
+        </div>
+        <div className="category-stats">
+          <small>
+            {isPl
+              ? `Zaznaczone: ${selectedIds.length}`
+              : `Selected: ${selectedIds.length}`}
+          </small>
+          <small>
+            {isPl
+              ? `Prompty objęte akcją: ${selectedPromptCount}`
+              : `Prompts affected: ${selectedPromptCount}`}
+          </small>
+          <small>
+            {isPl
+              ? `Widoczne: ${visibleCategories.length}`
+              : `Visible: ${visibleCategories.length}`}
+          </small>
+        </div>
+      </div>
+
+      {selectedIds.length > 0 ? (
+        <div className="category-selection-bar">
+          <div>
+            <strong>
+              {isPl
+                ? `Wybrano ${selectedIds.length} kategorii`
+                : `${selectedIds.length} categories selected`}
+            </strong>
+            <p>
+              {isPl
+                ? `Akcja obejmie ${selectedPromptCount} promptów.`
+                : `${selectedPromptCount} prompts will be affected.`}
+            </p>
+          </div>
+          <div className="row-gap">
+            <button
+              type="button"
+              className="ghost"
+              onClick={() => setBulkAction("move")}
+              disabled={availableTargetCategories.length === 0}
+            >
+              {isPl ? "Przenieś prompty" : "Move prompts"}
+            </button>
+            <button
+              type="button"
+              className="ghost"
+              onClick={() => setBulkAction("merge")}
+              disabled={availableTargetCategories.length === 0}
+            >
+              {isPl ? "Scal kategorie" : "Merge categories"}
+            </button>
+            <button type="button" className="danger" onClick={() => setBulkAction("delete")}>
+              {isPl ? "Usuń kategorie" : "Delete categories"}
+            </button>
+          </div>
+        </div>
+      ) : null}
+
       <div className="category-grid">
-        {lib.db.categories.map((category) => (
-          <article key={category.id} className="category-card">
+        {visibleCategories.map((category) => (
+          <article
+            key={category.id}
+            className={selectedIds.includes(category.id) ? "category-card selected" : "category-card"}
+          >
             {editingId === category.id ? (
               <>
                 <input value={editingName} onChange={(e) => setEditingName(e.target.value)} />
@@ -1543,6 +1844,22 @@ function CategoriesPage({ lib, language }: { lib: LibraryApi; language: Language
               </>
             ) : (
               <>
+                <div className="row-between">
+                  <label className="category-select">
+                    <input
+                      type="checkbox"
+                      checked={selectedIds.includes(category.id)}
+                      onChange={(e) => {
+                        if (category.id === UNCATEGORIZED_ID) return;
+                        setSelectedIds((prev) =>
+                          e.target.checked ? [...prev, category.id] : prev.filter((id) => id !== category.id)
+                        );
+                      }}
+                      disabled={category.id === UNCATEGORIZED_ID}
+                    />
+                    <span>{isPl ? "Zaznacz" : "Select"}</span>
+                  </label>
+                </div>
                 <h3>{category.id === UNCATEGORIZED_ID ? (isPl ? "Bez kategorii" : "Uncategorized") : category.name}</h3>
                 <p>{counts.get(category.id) || 0} {isPl ? "promptów" : "prompts"}</p>
                 <small>{isPl ? "Utworzono" : "Created"}: {new Date(category.createdAt).toLocaleDateString()}</small>
@@ -1560,7 +1877,85 @@ function CategoriesPage({ lib, language }: { lib: LibraryApi; language: Language
             )}
           </article>
         ))}
+        {visibleCategories.length === 0 ? (
+          <div className="surface">{isPl ? "Brak kategorii dla aktualnego filtra." : "No categories match the current filter."}</div>
+        ) : null}
       </div>
+
+      {bulkAction ? (
+        <section className="prompt-preview-backdrop" onClick={closeBulkAction}>
+          <article className="prompt-preview category-action-modal" onClick={(event) => event.stopPropagation()}>
+            <div className="row-between">
+              <div>
+                <h2>
+                  {bulkAction === "move"
+                    ? (isPl ? "Przenieś prompty" : "Move prompts")
+                    : bulkAction === "merge"
+                      ? (isPl ? "Scal kategorie" : "Merge categories")
+                      : (isPl ? "Usuń kategorie" : "Delete categories")}
+                </h2>
+                <p className="category-modal-copy">
+                  {bulkAction === "move"
+                    ? (isPl ? "Prompty zostaną przeniesione, a same kategorie pozostaną bez zmian." : "Prompts will be moved while the categories stay unchanged.")
+                    : bulkAction === "merge"
+                      ? (isPl ? "Prompty zostaną przeniesione, a zaznaczone kategorie źródłowe zostaną usunięte." : "Prompts will be moved and the selected source categories will be removed.")
+                      : (isPl ? "Zaznaczone kategorie zostaną usunięte, a ich prompty trafią do kategorii Bez kategorii." : "Selected categories will be removed and their prompts will move to Uncategorized.")}
+                </p>
+              </div>
+              <button className="ghost" onClick={closeBulkAction}>{isPl ? "Zamknij" : "Close"}</button>
+            </div>
+
+            <div className="category-modal-summary">
+              <small>{isPl ? `Kategorie: ${selectedIds.length}` : `Categories: ${selectedIds.length}`}</small>
+              <small>{isPl ? `Prompty: ${selectedPromptCount}` : `Prompts: ${selectedPromptCount}`}</small>
+            </div>
+
+            <div className="tag-cloud">
+              {selectedCategories.map((category) => (
+                <span key={category.id} className="chip">
+                  {categoryLabel(category)}
+                </span>
+              ))}
+            </div>
+
+            {bulkAction !== "delete" ? (
+              <label className="category-modal-field">
+                {bulkAction === "move"
+                  ? (isPl ? "Przenieś do" : "Move to")
+                  : (isPl ? "Scal do" : "Merge into")}
+                <select
+                  value={targetCategoryId}
+                  onChange={(e) => setTargetCategoryId(e.target.value)}
+                  disabled={availableTargetCategories.length === 0}
+                >
+                  {availableTargetCategories.map((category) => (
+                    <option key={category.id} value={category.id}>
+                      {categoryLabel(category)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ) : null}
+
+            <div className="row-gap">
+              <button
+                type="button"
+                onClick={confirmBulkAction}
+                disabled={bulkAction !== "delete" && !availableTargetCategories.some((category) => category.id === targetCategoryId)}
+              >
+                {bulkAction === "move"
+                  ? (isPl ? "Potwierdź przeniesienie" : "Confirm move")
+                  : bulkAction === "merge"
+                    ? (isPl ? "Potwierdź scalenie" : "Confirm merge")
+                    : (isPl ? "Potwierdź usunięcie" : "Confirm delete")}
+              </button>
+              <button type="button" className="ghost" onClick={closeBulkAction}>
+                {isPl ? "Anuluj" : "Cancel"}
+              </button>
+            </div>
+          </article>
+        </section>
+      ) : null}
     </div>
   );
 }
