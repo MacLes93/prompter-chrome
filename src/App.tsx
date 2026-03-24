@@ -922,6 +922,13 @@ function extensionOnlyFilterLabel(isPl: boolean) {
   return isPl ? "Tylko prompty zapisane w rozszerzeniu" : "Only prompts stored in extension";
 }
 
+function confirmPromptDeletion(title: string, isPl: boolean) {
+  const message = isPl
+    ? `Na pewno usunąć prompt "${title}"?`
+    : `Delete prompt "${title}"?`;
+  return window.confirm(message);
+}
+
 function generatePromptSourcePath(db: DbFile, prompt: Pick<Prompt, "id" | "title" | "tags" | "categoryId">) {
   const categoryName = db.categories.find((category) => category.id === prompt.categoryId)?.name ?? DEFAULT_UNCATEGORIZED_LABEL;
   const basePath = folderPromptPath(prompt, categoryName);
@@ -1921,7 +1928,6 @@ function PromptsPage({
               <option value="az">A-Z</option>
             </select>
           </label>
-          <button onClick={() => navigate("create")}>{isPl ? "+ Dodaj prompt" : "+ Add prompt"}</button>
         </div>
         <div className="library-filter-toggles" aria-label={isPl ? "Dodatkowe filtry" : "Additional filters"}>
           <button
@@ -2081,6 +2087,7 @@ function PromptsPage({
               <button
                 className="danger"
                 onClick={() => {
+                  if (!confirmPromptDeletion(selectedPrompt.title, isPl)) return;
                   lib.deletePrompt(selectedPrompt.id);
                   setSelectedPromptId(null);
                 }}
@@ -2250,6 +2257,7 @@ function CreatePromptPage({
               type="button"
               className="danger"
               onClick={() => {
+                if (!confirmPromptDeletion(editingPrompt.title, isPl)) return;
                 lib.deletePrompt(editingPrompt.id);
                 navigate("prompts");
               }}

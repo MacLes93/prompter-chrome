@@ -302,7 +302,7 @@ button.danger {
 
 .library-controls {
   display: grid;
-  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1.2fr) minmax(220px, 0.9fr);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.6rem;
 }
 
@@ -780,10 +780,6 @@ textarea {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .library-controls button {
-    grid-column: span 2;
-  }
-
   .library-filter-toggles {
     justify-content: flex-start;
   }
@@ -848,10 +844,6 @@ textarea {
 
   .library-controls {
     grid-template-columns: 1fr;
-  }
-
-  .library-controls button {
-    grid-column: auto;
   }
 
   .library-filter-toggles {
