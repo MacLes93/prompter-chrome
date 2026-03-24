@@ -918,6 +918,10 @@ function syncLabel(status: PromptSyncStatus, isPl: boolean) {
   return isPl ? "Tylko w rozszerzeniu" : "Local only";
 }
 
+function extensionOnlyFilterLabel(isPl: boolean) {
+  return isPl ? "Tylko prompty zapisane w rozszerzeniu" : "Only prompts stored in extension";
+}
+
 function generatePromptSourcePath(db: DbFile, prompt: Pick<Prompt, "id" | "title" | "tags" | "categoryId">) {
   const categoryName = db.categories.find((category) => category.id === prompt.categoryId)?.name ?? DEFAULT_UNCATEGORIZED_LABEL;
   const basePath = folderPromptPath(prompt, categoryName);
@@ -1917,13 +1921,27 @@ function PromptsPage({
               <option value="az">A-Z</option>
             </select>
           </label>
-          <button className={favoriteOnly ? "ghost active-filter" : "ghost"} onClick={() => setFavoriteOnly((v) => !v)}>
-            ⭐ {isPl ? "Ulubione" : "Favorites"}
-          </button>
-          <button className={extensionOnly ? "ghost active-filter" : "ghost"} onClick={() => setExtensionOnly((v) => !v)}>
-            {isPl ? "Tylko w rozszerzeniu" : "Local only"}
-          </button>
           <button onClick={() => navigate("create")}>{isPl ? "+ Dodaj prompt" : "+ Add prompt"}</button>
+        </div>
+        <div className="library-filter-toggles" aria-label={isPl ? "Dodatkowe filtry" : "Additional filters"}>
+          <button
+            type="button"
+            className={favoriteOnly ? "ghost compact-filter active-filter active-filter-favorite" : "ghost compact-filter"}
+            aria-pressed={favoriteOnly}
+            onClick={() => setFavoriteOnly((v) => !v)}
+          >
+            <span className="compact-filter-icon" aria-hidden="true">★</span>
+            <span>{isPl ? "Tylko ulubione" : "Favorites only"}</span>
+          </button>
+          <button
+            type="button"
+            className={extensionOnly ? "ghost compact-filter active-filter active-filter-local" : "ghost compact-filter"}
+            aria-pressed={extensionOnly}
+            onClick={() => setExtensionOnly((v) => !v)}
+          >
+            <span className="compact-filter-icon" aria-hidden="true">⌂</span>
+            <span>{extensionOnlyFilterLabel(isPl)}</span>
+          </button>
         </div>
       </section>
 

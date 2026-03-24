@@ -302,7 +302,7 @@ button.danger {
 
 .library-controls {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1.2fr) minmax(220px, 0.9fr);
   gap: 0.6rem;
 }
 
@@ -319,9 +319,74 @@ button.danger {
   width: 100%;
 }
 
-.active-filter {
+.library-filter-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 0.7rem;
+}
+
+.compact-filter {
+  width: auto;
+  min-height: 2.25rem;
+  padding: 0.4rem 0.72rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.42rem;
+  font-size: 0.84rem;
+  font-weight: 600;
+  border-radius: 999px;
+  color: #b9c8e8;
+  border: 1px solid #3a4f78;
+  background: #1c2d4a;
+}
+
+.compact-filter span:first-child {
+  font-size: 0.95rem;
+  line-height: 1;
+}
+
+.compact-filter-icon {
+  width: 1.15rem;
+  height: 1.15rem;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  color: currentColor;
+  transition: background 120ms ease, color 120ms ease, box-shadow 120ms ease;
+}
+
+.ghost.compact-filter.active-filter {
   border-color: #6657ff;
   background: #3e34a8;
+  color: #d7e1ff;
+  box-shadow: none;
+}
+
+.ghost.compact-filter.active-filter-favorite {
+  border-color: #6657ff;
+  background: #3e34a8;
+  color: #f5f7ff;
+}
+
+.ghost.compact-filter.active-filter-favorite .compact-filter-icon {
+  background: rgba(255, 255, 255, 0.16);
+  color: #d7e1ff;
+  box-shadow: none;
+}
+
+.ghost.compact-filter.active-filter-local {
+  border-color: #6657ff;
+  background: #3e34a8;
+  color: #f5f7ff;
+}
+
+.ghost.compact-filter.active-filter-local .compact-filter-icon {
+  background: rgba(255, 255, 255, 0.16);
+  color: #d7e1ff;
+  box-shadow: none;
 }
 
 .library-toolbar {
@@ -715,6 +780,14 @@ textarea {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .library-controls button {
+    grid-column: span 2;
+  }
+
+  .library-filter-toggles {
+    justify-content: flex-start;
+  }
+
   .library-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -771,6 +844,23 @@ textarea {
   .category-grid,
   .dashboard-grid {
     grid-template-columns: 1fr;
+  }
+
+  .library-controls {
+    grid-template-columns: 1fr;
+  }
+
+  .library-controls button {
+    grid-column: auto;
+  }
+
+  .library-filter-toggles {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .compact-filter {
+    justify-content: center;
   }
 
   .recent-panel,
