@@ -96,5 +96,10 @@ After code changes:
 ## Required Permissions
 
 - `storage` - save app data and settings.
-- `downloads` - download exported prompt archives and optional legacy JSON exports.
 - Host permissions for `https://chatgpt.com/*` and `https://claude.ai/*` - quick-save widget injection.
+
+## Privacy
+
+- The extension stores prompts, tags, categories, settings, and optional folder-sync metadata locally on the user's device.
+- No analytics, tracking, or external network transmission is used by the extension.
+- Publish [PRIVACY.md](/Users/mlesniewski/Codex/prompter/prompter_chrome/PRIVACY.md) at a public URL and use that URL in the Chrome Web Store privacy policy field before submission.

@@ -15,7 +15,10 @@
   "background": {
     "service_worker": "background.js"
   },
-  "permissions": ["storage", "downloads"],
+  "permissions": ["storage"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'"
+  },
   "host_permissions": ["https://chatgpt.com/*", "https://claude.ai/*"],
   "content_scripts": [
     {

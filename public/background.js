@@ -1,7 +1,6 @@
-const BACKUP_FILE = "prompter_chrome/prompts-latest.json";
 const STORAGE_KEY = "prompter.prompts.v1";
 const UNCATEGORIZED_ID = "uncategorized";
-let latestJson = "";
+const ALLOWED_MESSAGE_HOSTS = new Set(["chatgpt.com", "claude.ai"]);
 
 function nowIso() {
   return new Date().toISOString();
@@ -156,36 +155,36 @@ async function savePromptFromPage(payload) {
   return { ok: true };
 }
 
-function writeBackupNow() {
-  if (!latestJson) return;
+function isTrustedExtensionMessageSender(sender) {
+  if (!sender || sender.id !== chrome.runtime.id) return false;
+  if (!sender.url) return false;
 
-  const url = `data:application/json;charset=utf-8,${encodeURIComponent(latestJson)}`;
-  chrome.downloads.download(
-    {
-      url,
-      filename: BACKUP_FILE,
-      saveAs: false,
-      conflictAction: "overwrite"
-    },
-    () => {
-      if (chrome.runtime.lastError) {
-        console.warn("Prompter backup warning:", chrome.runtime.lastError.message);
-      }
-    }
-  );
+  try {
+    const url = new URL(sender.url);
+    return ALLOWED_MESSAGE_HOSTS.has(url.hostname);
+  } catch {
+    return false;
+  }
 }
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (!message || typeof message !== "object") return;
+function isSavePromptPayload(payload) {
+  return !!payload &&
+    typeof payload === "object" &&
+    typeof payload.title === "string" &&
+    typeof payload.content === "string" &&
+    typeof payload.tags === "string";
+}
 
-  if (message.type === "BACKUP_NOW" && typeof message.json === "string") {
-    latestJson = message.json;
-    writeBackupNow();
-    sendResponse({ ok: true });
-    return;
-  }
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (!message || typeof message !== "object") return;
+  if (!isTrustedExtensionMessageSender(sender)) return;
 
   if (message.type === "SAVE_PROMPT_FROM_PAGE") {
+    if (!isSavePromptPayload(message.payload)) {
+      sendResponse({ ok: false, error: "Invalid payload" });
+      return;
+    }
+
     void savePromptFromPage(message.payload)
       .then(() => sendResponse({ ok: true }))
       .catch((error) => {
