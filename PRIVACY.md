@@ -40,6 +40,3 @@ Prompter Chrome stores prompt data locally so the extension can manage your prom
 - You can disable the quick-save widget in extension settings
 - You can disconnect the optional synced folder at any time
 
-## Contact
-
-Before Chrome Web Store submission, publish this policy at a stable public URL and use that URL in the store listing privacy policy field.
