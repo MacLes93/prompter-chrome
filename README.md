@@ -103,3 +103,20 @@ After code changes:
 - The extension stores prompts, tags, categories, settings, and optional folder-sync metadata locally on the user's device.
 - No analytics, tracking, or external network transmission is used by the extension.
 - [PRIVACY.md](https://github.com/MacLes93/prompter-chrome/blob/main/PRIVACY.md) contains all privacy related information.
+
+## Chrome Web Store Notes
+
+Use the following justifications in the Chrome Web Store Developer Dashboard. These go into the `Privacy` tab in the dashboard, not into `manifest.json`.
+
+- Single purpose:
+  Manage a local prompt library in Chrome with optional quick-save support on ChatGPT and Claude.
+- `storage` permission:
+  Stores prompts, categories, tags, favorites, sync metadata, and user settings locally on the device using `chrome.storage.local`.
+- Host permission `https://chatgpt.com/*`:
+  Used only to show the optional `Save to Prompter` widget on ChatGPT pages and let the user save selected conversation content into the extension.
+- Host permission `https://claude.ai/*`:
+  Used only to show the optional `Save to Prompter` widget on Claude pages and let the user save selected conversation content into the extension.
+- Remote code:
+  The extension does not use remote code. All application logic is packaged with the extension bundle.
+- User data handling summary:
+  Prompt data, tags, categories, favorites, settings, and optional folder-sync metadata are stored locally on the user's device. The extension does not send this data to external servers, does not use analytics, and does not sell or share user data.
