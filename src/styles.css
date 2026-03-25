@@ -542,6 +542,13 @@ textarea {
   color: #a6b7da;
 }
 
+.editor-inline-helper {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.5rem;
+  align-items: center;
+}
+
 .checkbox-row {
   display: flex;
   align-items: center;
@@ -843,6 +850,10 @@ textarea {
   }
 
   .library-controls {
+    grid-template-columns: 1fr;
+  }
+
+  .editor-inline-helper {
     grid-template-columns: 1fr;
   }
 

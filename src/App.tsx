@@ -85,7 +85,7 @@ type LibraryApi = {
   deletePrompt: (id: string) => void;
   duplicatePrompt: (id: string) => string;
   copyPrompt: (id: string) => Promise<void>;
-  createCategory: (name: string) => void;
+  createCategory: (name: string) => string | null;
   renameCategory: (id: string, name: string) => void;
   deleteCategory: (id: string) => void;
   deleteCategories: (ids: string[]) => void;
@@ -922,11 +922,38 @@ function extensionOnlyFilterLabel(isPl: boolean) {
   return isPl ? "Tylko prompty zapisane w rozszerzeniu" : "Only prompts stored in extension";
 }
 
-function confirmPromptDeletion(title: string, isPl: boolean) {
-  const message = isPl
-    ? `Na pewno usunąć prompt "${title}"?`
-    : `Delete prompt "${title}"?`;
-  return window.confirm(message);
+function ConfirmActionModal({
+  title,
+  body,
+  confirmLabel,
+  cancelLabel,
+  onConfirm,
+  onClose
+}: {
+  title: string;
+  body: string;
+  confirmLabel: string;
+  cancelLabel: string;
+  onConfirm: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <section className="prompt-preview-backdrop" onClick={onClose}>
+      <article className="prompt-preview category-action-modal" onClick={(event) => event.stopPropagation()}>
+        <div className="row-between">
+          <div>
+            <h2>{title}</h2>
+            <p className="category-modal-copy">{body}</p>
+          </div>
+          <button className="ghost" onClick={onClose}>{cancelLabel}</button>
+        </div>
+        <div className="row-gap">
+          <button type="button" className="danger" onClick={onConfirm}>{confirmLabel}</button>
+          <button type="button" className="ghost" onClick={onClose}>{cancelLabel}</button>
+        </div>
+      </article>
+    </section>
+  );
 }
 
 function generatePromptSourcePath(db: DbFile, prompt: Pick<Prompt, "id" | "title" | "tags" | "categoryId">) {
@@ -1451,6 +1478,7 @@ function useLibrary(language: Language): LibraryApi {
       );
     },
     createCategory: (name) => {
+      let createdId: string | null = null;
       withValidation(() => {
         const trimmed = name.trim();
         if (!trimmed) throw new Error(txt(language, "Nazwa kategorii jest wymagana", "Category name is required"));
@@ -1458,12 +1486,14 @@ function useLibrary(language: Language): LibraryApi {
           if (prev.categories.some((c) => c.name.toLowerCase() === trimmed.toLowerCase())) {
             throw new Error(txt(language, "Kategoria o tej nazwie już istnieje", "Category with this name already exists"));
           }
+          createdId = uuid();
           return {
             ...prev,
-            categories: [...prev.categories, { id: uuid(), name: trimmed, createdAt: nowIso() }]
+            categories: [...prev.categories, { id: createdId, name: trimmed, createdAt: nowIso() }]
           };
         }, txt(language, "Dodano kategorię", "Category added"));
       });
+      return createdId;
     },
     renameCategory: (id, name) => {
       withValidation(() => {
@@ -1825,6 +1855,7 @@ function PromptsPage({
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [sortMode, setSortMode] = useState<SortMode>("newest");
   const [selectedPromptId, setSelectedPromptId] = useState<string | null>(null);
+  const [promptDeleteTarget, setPromptDeleteTarget] = useState<Prompt | null>(null);
 
   const prompts = lib.db.prompts;
   const categories = lib.db.categories;
@@ -2086,17 +2117,29 @@ function PromptsPage({
               </button>
               <button
                 className="danger"
-                onClick={() => {
-                  if (!confirmPromptDeletion(selectedPrompt.title, isPl)) return;
-                  lib.deletePrompt(selectedPrompt.id);
-                  setSelectedPromptId(null);
-                }}
+                onClick={() => setPromptDeleteTarget(selectedPrompt)}
               >
                 {isPl ? "Usuń" : "Delete"}
               </button>
             </div>
           </article>
         </section>
+      ) : null}
+      {promptDeleteTarget ? (
+        <ConfirmActionModal
+          title={isPl ? "Usuń prompt" : "Delete prompt"}
+          body={isPl
+            ? `Na pewno usunąć prompt "${promptDeleteTarget.title}"?`
+            : `Are you sure you want to delete "${promptDeleteTarget.title}"?`}
+          confirmLabel={isPl ? "Usuń prompt" : "Delete prompt"}
+          cancelLabel={isPl ? "Anuluj" : "Cancel"}
+          onClose={() => setPromptDeleteTarget(null)}
+          onConfirm={() => {
+            lib.deletePrompt(promptDeleteTarget.id);
+            setSelectedPromptId(null);
+            setPromptDeleteTarget(null);
+          }}
+        />
       ) : null}
     </div>
   );
@@ -2123,6 +2166,8 @@ function CreatePromptPage({
 
   const [draft, setDraft] = useState<PromptDraft>(lib.createPrompt());
   const [newTagInput, setNewTagInput] = useState("");
+  const [newCategoryInput, setNewCategoryInput] = useState("");
+  const [showDeletePromptConfirm, setShowDeletePromptConfirm] = useState(false);
 
   useEffect(() => {
     if (!editingPrompt) {
@@ -2162,6 +2207,13 @@ function CreatePromptPage({
     setDraft((prev) => ({ ...prev, tags: prev.tags.filter((t) => t !== tag) }));
   }
 
+  function addCategoryFromForm() {
+    const createdId = lib.createCategory(newCategoryInput);
+    if (!createdId) return;
+    setDraft((prev) => ({ ...prev, categoryId: createdId }));
+    setNewCategoryInput("");
+  }
+
   function onSubmit(event: FormEvent) {
     event.preventDefault();
     const promptId = lib.upsertPrompt(draft);
@@ -2198,6 +2250,22 @@ function CreatePromptPage({
             ))}
           </select>
         </label>
+        <div className="editor-inline-helper">
+          <input
+            value={newCategoryInput}
+            onChange={(e) => setNewCategoryInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                addCategoryFromForm();
+              }
+            }}
+            placeholder={isPl ? "Dodaj nową kategorię" : "Add a new category"}
+          />
+          <button type="button" className="ghost" onClick={addCategoryFromForm}>
+            {isPl ? "Dodaj kategorię" : "Add category"}
+          </button>
+        </div>
 
         <label>
           {isPl ? "Treść" : "Content"} *
@@ -2256,17 +2324,29 @@ function CreatePromptPage({
             <button
               type="button"
               className="danger"
-              onClick={() => {
-                if (!confirmPromptDeletion(editingPrompt.title, isPl)) return;
-                lib.deletePrompt(editingPrompt.id);
-                navigate("prompts");
-              }}
+              onClick={() => setShowDeletePromptConfirm(true)}
             >
               {isPl ? "Usuń prompt" : "Delete prompt"}
             </button>
           ) : null}
         </div>
       </form>
+      {editingPrompt && showDeletePromptConfirm ? (
+        <ConfirmActionModal
+          title={isPl ? "Usuń prompt" : "Delete prompt"}
+          body={isPl
+            ? `Na pewno usunąć prompt "${editingPrompt.title}"?`
+            : `Are you sure you want to delete "${editingPrompt.title}"?`}
+          confirmLabel={isPl ? "Usuń prompt" : "Delete prompt"}
+          cancelLabel={isPl ? "Anuluj" : "Cancel"}
+          onClose={() => setShowDeletePromptConfirm(false)}
+          onConfirm={() => {
+            lib.deletePrompt(editingPrompt.id);
+            setShowDeletePromptConfirm(false);
+            navigate("prompts");
+          }}
+        />
+      ) : null}
     </section>
   );
 }
@@ -2282,6 +2362,7 @@ function CategoriesPage({ lib, language }: { lib: LibraryApi; language: Language
   const [sortMode, setSortMode] = useState<CategorySortMode>("az");
   const [bulkAction, setBulkAction] = useState<CategoryBulkAction | null>(null);
   const [targetCategoryId, setTargetCategoryId] = useState<string>(UNCATEGORIZED_ID);
+  const [categoryDeleteTarget, setCategoryDeleteTarget] = useState<Category | null>(null);
 
   const counts = useMemo(() => {
     const map = new Map<string, number>();
@@ -2534,7 +2615,12 @@ function CategoriesPage({ lib, language }: { lib: LibraryApi; language: Language
                   {category.id !== UNCATEGORIZED_ID ? (
                     <>
                       <button className="ghost" onClick={() => { setEditingId(category.id); setEditingName(category.name); }}>{isPl ? "Zmień nazwę" : "Rename"}</button>
-                      <button className="danger" onClick={() => lib.deleteCategory(category.id)}>{isPl ? "Usuń" : "Delete"}</button>
+                      <button
+                        className="danger"
+                        onClick={() => setCategoryDeleteTarget(category)}
+                      >
+                        {isPl ? "Usuń" : "Delete"}
+                      </button>
                     </>
                   ) : (
                     <button className="ghost" disabled>{isPl ? "Kategoria systemowa" : "System category"}</button>
@@ -2622,6 +2708,21 @@ function CategoriesPage({ lib, language }: { lib: LibraryApi; language: Language
             </div>
           </article>
         </section>
+      ) : null}
+      {categoryDeleteTarget ? (
+        <ConfirmActionModal
+          title={isPl ? "Usuń kategorię" : "Delete category"}
+          body={isPl
+            ? `Na pewno usunąć kategorię "${categoryDeleteTarget.name}"? Powiązane prompty trafią do kategorii Bez kategorii.`
+            : `Are you sure you want to delete "${categoryDeleteTarget.name}"? Related prompts will be moved to Uncategorized.`}
+          confirmLabel={isPl ? "Usuń kategorię" : "Delete category"}
+          cancelLabel={isPl ? "Anuluj" : "Cancel"}
+          onClose={() => setCategoryDeleteTarget(null)}
+          onConfirm={() => {
+            lib.deleteCategory(categoryDeleteTarget.id);
+            setCategoryDeleteTarget(null);
+          }}
+        />
       ) : null}
     </div>
   );
@@ -2846,6 +2947,49 @@ function DataPage({
   return (
     <div className="data-layout">
       <section className="surface">
+        <h2>{isPl ? "Import / Eksport" : "Import / Export"}</h2>
+        <p>
+          {isPl
+            ? "Import z katalogu wczytuje pliki Markdown z całej struktury folderów, a eksport zapisuje całą bibliotekę do jednego pliku ZIP."
+            : "Folder import reads Markdown files from the whole directory structure, while export saves the whole library to a single ZIP file."}
+        </p>
+        <div className="row-gap">
+          {legacyJsonExportEnabled ? (
+            <button onClick={downloadExport}>{isPl ? "Eksport JSON (legacy)" : "Export JSON (legacy)"}</button>
+          ) : null}
+          {legacyJsonExportEnabled ? (
+            <button className="ghost" onClick={() => fileRef.current?.click()}>{isPl ? "Import JSON (legacy)" : "Import JSON (legacy)"}</button>
+          ) : null}
+          <button className="ghost" onClick={() => markdownFolderRef.current?.click()}>
+            {isPl ? "Otwórz katalog promptów" : "Open prompts folder"}
+          </button>
+          <button className="ghost" onClick={() => void exportPromptsZip()} disabled={markdownExportBusy}>
+            {markdownExportBusy
+              ? (isPl ? "Eksportowanie promptów..." : "Exporting prompts...")
+              : (isPl ? "Eksportuj prompty" : "Export prompts")}
+          </button>
+          <input ref={fileRef} type="file" accept="application/json,.json" onChange={onFileImport} hidden />
+          <input
+            ref={markdownFolderRef}
+            type="file"
+            accept=".md,text/markdown"
+            multiple
+            onChange={onMarkdownFolderImport}
+            {...({ webkitdirectory: "", directory: "" } as Record<string, string>)}
+            hidden
+          />
+        </div>
+        <ul className="stats-list">
+          <li>{isPl ? "otwierasz katalog z promptami," : "open a prompts folder,"}</li>
+          <li>{isPl ? "sprawdzasz podgląd i zaznaczasz rekordy do importu," : "review the preview and select records to import,"}</li>
+          <li>{isPl ? "przy imporcie Markdown katalog główny jest ignorowany, pierwszy pod nim tworzy kategorię, kolejne tworzą tagi," : "during Markdown import the root folder is ignored, the first nested folder becomes the category, and the following folders become tags,"}</li>
+          <li>{isPl ? "eksport promptów tworzy jeden plik ZIP z odtworzoną strukturą katalogów." : "prompt export creates a single ZIP file with the reconstructed folder structure."}</li>
+        </ul>
+        {importError ? <p className="import-error">{importError}</p> : null}
+        {markdownImportError ? <p className="import-error">{markdownImportError}</p> : null}
+      </section>
+
+      <section className="surface">
         <h2>{isPl ? "Synchronizacja katalogu" : "Folder sync"}</h2>
         <p>
           {isPl
@@ -2873,90 +3017,6 @@ function DataPage({
           <li>{isPl ? "Tylko w rozszerzeniu" : "Local only"}: {localOnlyCount}</li>
           <li>{isPl ? "Problemy synchronizacji" : "Sync issues"}: {syncIssues.length}</li>
         </ul>
-      </section>
-
-      <section className="surface">
-        <h2>{isPl ? "Import / Eksport" : "Import / Export"}</h2>
-        <p>
-          {isPl
-            ? "Open prompts folder importuje pliki Markdown z całego katalogu. Katalog główny jest ignorowany, pierwszy folder pod nim staje się kategorią, a kolejne foldery stają się tagami. Export prompts zapisuje całą bibliotekę do jednego pliku ZIP z tą samą strukturą."
-            : "Open prompts folder imports Markdown files from a whole directory. The root folder is ignored, the first nested folder becomes the category, and the following folders become tags. Export prompts writes the whole library to a single ZIP file using the same structure."}
-        </p>
-        <div className="row-gap">
-          {legacyJsonExportEnabled ? (
-            <button onClick={downloadExport}>{isPl ? "Eksport JSON (legacy)" : "Export JSON (legacy)"}</button>
-          ) : null}
-          {legacyJsonExportEnabled ? (
-            <button className="ghost" onClick={() => fileRef.current?.click()}>{isPl ? "Import JSON (legacy)" : "Import JSON (legacy)"}</button>
-          ) : null}
-          <button className="ghost" onClick={() => markdownFolderRef.current?.click()}>
-            {isPl ? "Open prompts folder" : "Open prompts folder"}
-          </button>
-          <button className="ghost" onClick={() => void exportPromptsZip()} disabled={markdownExportBusy}>
-            {markdownExportBusy
-              ? (isPl ? "Eksport promptów..." : "Exporting prompts...")
-              : "Export prompts"}
-          </button>
-          <input ref={fileRef} type="file" accept="application/json,.json" onChange={onFileImport} hidden />
-          <input
-            ref={markdownFolderRef}
-            type="file"
-            accept=".md,text/markdown"
-            multiple
-            onChange={onMarkdownFolderImport}
-            {...({ webkitdirectory: "", directory: "" } as Record<string, string>)}
-            hidden
-          />
-        </div>
-        {importError ? <p className="import-error">{importError}</p> : null}
-        {markdownImportError ? <p className="import-error">{markdownImportError}</p> : null}
-      </section>
-
-      <section className="surface">
-        <h2>{isPl ? "Problemy synchronizacji" : "Sync issues"}</h2>
-        {syncIssues.length === 0 ? (
-          <p>{isPl ? "Brak konfliktów i brakujących plików." : "No conflicts or missing files."}</p>
-        ) : (
-          <div className="import-list">
-            {syncIssues.map((prompt) => {
-              const status = lib.getPromptSyncStatus(prompt);
-              return (
-                <div key={prompt.id} className="import-item selected">
-                  <div>
-                    <div className="row-between">
-                      <strong>{prompt.title}</strong>
-                      <span className="import-badge update">{syncLabel(status, isPl)}</span>
-                    </div>
-                    <small className="import-path">{prompt.sourcePath}</small>
-                    <p>{prompt.content.slice(0, 120)}{prompt.content.length > 120 ? "..." : ""}</p>
-                    <div className="row-gap">
-                      {status === "conflict" ? (
-                        <>
-                          <button className="ghost" onClick={() => void lib.importPromptFromFolder(prompt.id)}>
-                            {isPl ? "Wczytaj z pliku" : "Import from file"}
-                          </button>
-                          <button onClick={() => void lib.overwritePromptToFolder(prompt.id)}>
-                            {isPl ? "Nadpisz plik" : "Overwrite file"}
-                          </button>
-                        </>
-                      ) : null}
-                      {status === "missing_file" ? (
-                        <>
-                          <button onClick={() => void lib.overwritePromptToFolder(prompt.id)}>
-                            {isPl ? "Zapisz ponownie do katalogu" : "Write back to folder"}
-                          </button>
-                          <button className="ghost" onClick={() => lib.disconnectPromptFromFolder(prompt.id)}>
-                            {isPl ? "Odłącz plik" : "Disconnect file"}
-                          </button>
-                        </>
-                      ) : null}
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        )}
       </section>
 
       {importPreview ? (
@@ -3103,16 +3163,6 @@ function DataPage({
       ) : null}
 
       <section className="surface">
-        <h2>{isPl ? "Jak działa import" : "How import works"}</h2>
-        <ul className="stats-list">
-          <li>{isPl ? "otwierasz katalog z promptami," : "open a prompts folder,"}</li>
-          <li>{isPl ? "sprawdzasz podgląd i zaznaczasz rekordy do importu," : "review the preview and select records to import,"}</li>
-          <li>{isPl ? "przy imporcie Markdown katalog główny jest ignorowany, pierwszy pod nim tworzy kategorię, kolejne tworzą tagi," : "during Markdown import the root folder is ignored, the first nested folder becomes the category, and the following folders become tags,"}</li>
-          <li>{isPl ? "eksport promptów tworzy jeden plik ZIP z odtworzoną strukturą katalogów." : "prompt export creates a single ZIP file with the reconstructed folder structure."}</li>
-        </ul>
-      </section>
-
-      <section className="surface">
         <h2>{isPl ? "Podsumowanie danych" : "Data summary"}</h2>
         <ul className="stats-list">
           <li>{isPl ? "Wersja formatu" : "Format version"}: {lib.db.version}</li>
@@ -3120,6 +3170,53 @@ function DataPage({
           <li>{isPl ? "Liczba kategorii" : "Categories count"}: {lib.db.categories.length}</li>
           <li>{isPl ? "Unikalne tagi" : "Unique tags"}: {new Set(lib.db.prompts.flatMap((p) => p.tags)).size}</li>
         </ul>
+      </section>
+
+      <section className="surface">
+        <h2>{isPl ? "Problemy synchronizacji" : "Sync issues"}</h2>
+        {syncIssues.length === 0 ? (
+          <p>{isPl ? "Brak konfliktów i brakujących plików." : "No conflicts or missing files."}</p>
+        ) : (
+          <div className="import-list">
+            {syncIssues.map((prompt) => {
+              const status = lib.getPromptSyncStatus(prompt);
+              return (
+                <div key={prompt.id} className="import-item selected">
+                  <div>
+                    <div className="row-between">
+                      <strong>{prompt.title}</strong>
+                      <span className="import-badge update">{syncLabel(status, isPl)}</span>
+                    </div>
+                    <small className="import-path">{prompt.sourcePath}</small>
+                    <p>{prompt.content.slice(0, 120)}{prompt.content.length > 120 ? "..." : ""}</p>
+                    <div className="row-gap">
+                      {status === "conflict" ? (
+                        <>
+                          <button className="ghost" onClick={() => void lib.importPromptFromFolder(prompt.id)}>
+                            {isPl ? "Wczytaj z pliku" : "Import from file"}
+                          </button>
+                          <button onClick={() => void lib.overwritePromptToFolder(prompt.id)}>
+                            {isPl ? "Nadpisz plik" : "Overwrite file"}
+                          </button>
+                        </>
+                      ) : null}
+                      {status === "missing_file" ? (
+                        <>
+                          <button onClick={() => void lib.overwritePromptToFolder(prompt.id)}>
+                            {isPl ? "Zapisz ponownie do katalogu" : "Write back to folder"}
+                          </button>
+                          <button className="ghost" onClick={() => lib.disconnectPromptFromFolder(prompt.id)}>
+                            {isPl ? "Odłącz plik" : "Disconnect file"}
+                          </button>
+                        </>
+                      ) : null}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </section>
 
     </div>
